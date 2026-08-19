@@ -105,7 +105,7 @@ async def start_baccarat_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         bet_choice = b_info["choice"]
         bet_money = b_info["money"]
         if bet_choice == winner:
-            if winner == "타이" and bet_choice in ["플레이어", "뱅커"]:
+            if winner == "타이" and bet_choice in ["플레이어", "뱅ker"]:
                 db[u_id]["money"] += bet_money
                 summary_results.append(f"🤝 {b_info['name']}: 타이 발생으로 금액 {bet_money:,}원 전액 환불")
             else:
