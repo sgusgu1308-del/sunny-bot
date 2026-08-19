@@ -5,12 +5,14 @@ import random
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
-# 로그 설정
+# 로그 설정 (봇 상태 모니터링)
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 TOKEN = "8901087051:AAHzB6cuZYdMpVn08_BpAI4VNfANu4CWRs4"
 DB_FILE = "sunny_bot_db.json"
-ADMIN_IDS = ["7155379964", "8684501150"]
+
+# 👑 요청하신 두 분의 관리자 고유 ID를 완벽하게 연동했습니다!
+ADMIN_IDS = ["8684501150", "7155379964"]
 
 def load_data():
     if os.path.exists(DB_FILE):
@@ -20,13 +22,19 @@ def load_data():
 def save_data(data):
     with open(DB_FILE, 'w', encoding='utf-8') as f: json.dump(data, f, ensure_ascii=False, indent=4)
 
+# 카드의 합을 바카라 규칙(일의 자리만 계산)으로 점수화하는 함수
 def get_baccarat_score(cards):
     card_values = {"A": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "10": 0, "J": 0, "Q": 0, "K": 0}
-    return sum(card_values[c.split('_')] for c in cards) % 10
+    return sum(card_values[c.split('_')[0]] for c in cards) % 10
 
+# 포커 카드 배열을 보기 좋은 문양 텍스트로 변환하는 함수
 def display_cards(cards):
     s_map = {"S": "♠️", "H": "♥️", "D": "♦️", "C": "♣️"}
-    return " ".join([f"[ {s_map[c.split('_')]} {c.split('_')} ]" for c in cards])
+    result = []
+    for card in cards:
+        r, s = card.split('_')
+        result.append(f"[ {s_map[s]} {r} ]")
+    return " ".join(result)
 
 # 레벨별 등급 이름 및 아이콘 정의
 def get_level_title(level):
@@ -54,7 +62,7 @@ async def handle_korean_commands(update: Update, context: ContextTypes.DEFAULT_T
 
     is_command = text.startswith("/")
     
-    # [시스템 기능] 일반 채팅 제어 로직 (채팅 증가, 경험치 계산 및 레벨업 시스템)
+    # [시스템 기능] 일반 채팅 제어 로직 (경험치 및 총 채팅수 증가)
     if not is_command:
         db[user_id]["exp"] += 1          
         db[user_id]["total_chats"] += 1   
@@ -78,8 +86,7 @@ async def handle_korean_commands(update: Update, context: ContextTypes.DEFAULT_T
                 f"👤 <b>{user_name}</b>님의 등급이 상승했습니다!\n"
                 f"✨ 현재 등급: <b>{get_level_title(new_lvl)} (Lv.{new_lvl})</b>\n"
                 f"🎁 레벨업 보상금 <b>{bonus:,}원</b>이 지급되었습니다!💰",
-                print_mode="HTML" if 'print_mode' in locals() else None,
-                **{"parse_mode": "HTML"}
+                parse_mode="HTML"
             )
             return
         else:
@@ -103,8 +110,10 @@ async def handle_korean_commands(update: Update, context: ContextTypes.DEFAULT_T
         bet_choice = parts[1]
         if bet_choice not in ["플레이어", "뱅커", "타이"]:
             await update.message.reply_text("⚠️ 배팅 대상은 <b>플레이어, 뱅커, 타이</b> 중에서 골라주세요!", parse_mode="HTML"); return
-        try: bet_money = int(parts[2])
-        except ValueError: await update.message.reply_text("⚠️ 배팅 금액은 숫자만 입력해 주세요!"); return
+        try:
+            bet_money = int(parts[2])
+        except ValueError:
+            await update.message.reply_text("⚠️ 배팅 금액은 숫자만 입력해 주세요!"); return
         if bet_money <= 0 or db[user_id]["money"] < bet_money:
             await update.message.reply_text(f"❌ 잔액이 부족하거나 올바르지 않은 금액입니다. 현재 잔액: {db[user_id]['money']:,}원"); return
 
@@ -142,36 +151,34 @@ async def handle_korean_commands(update: Update, context: ContextTypes.DEFAULT_T
         )
         await update.message.reply_text(caption_msg, parse_mode="HTML")
 
-    # 3. 🎟️ 커스텀 확률 반영된 /복권 명령어 시스템
+    # 3. 🎟️ 커스텀 확률 반영 /복권 명령어 시스템
     elif text == "/복권":
         ticket_price = 1000
         if db[user_id]["money"] < ticket_price:
             await update.message.reply_text(f"❌ 복권 구입 금액(1,000원)이 부족합니다! 현재 잔액: {db[user_id]['money']:,}원"); return
         
         db[user_id]["money"] -= ticket_price
-        
-        # 0.1% 단위 정밀 계산을 위해 1부터 1000까지 난수 발생 (100% = 1000)
         rand_val = random.randint(1, 1000)
         
-        if rand_val <= 2:  # 0.2% 확률 (1, 2)
+        if rand_val <= 2:  # 0.2% 확률
             prize = 50000
             result_text = f"🍀 <b>[1등 대박 특등첨!]</b> 무려 <b>{prize:,}원</b>에 당첨되었습니다!!! 🎉"
-        elif 3 <= rand_val <= 12:  # 1.0% 확률 (3 ~ 12까지 10개)
+        elif 3 <= rand_val <= 12:  # 1.0% 확률
             prize = 10000
             result_text = f"🌟 <b>[2등 중박 당첨!]</b> 축하합니다! <b>{prize:,}원</b>에 당첨되었습니다! 🎊"
-        elif 13 <= rand_val <= 62:  # 5.0% 확률 (13 ~ 62까지 50개)
+        elif 13 <= rand_val <= 62:  # 5.0% 확률
             prize = 5000
             result_text = f"🎈 <b>[3등 소박 당첨!]</b> <b>{prize:,}원</b>에 당첨되셨습니다!"
-        elif 63 <= rand_val <= 462:  # 40.0% 확률 (63 ~ 462까지 400개)
+        elif 63 <= rand_val <= 462:  # 40.0% 확률
             prize = 0
             result_text = "😭 <b>[꽝]</b> 아쉽게도 낙첨되었습니다. 다음 기회를 노려보세요!"
-        elif 463 <= rand_val <= 640:  # 17.8% 확률 (463 ~ 640까지 178개)
+        elif 463 <= rand_val <= 640:  # 17.8% 확률
             prize = 300
             result_text = f"🪙 <b>[아차상 당첨]</b> <b>{prize:,}원</b>을 획득하셨습니다."
-        elif 641 <= rand_val <= 820:  # 18.0% 확률 (641 ~ 820까지 180개)
+        elif 641 <= rand_val <= 820:  # 18.0% 확률
             prize = 200
             result_text = f"🪙 <b>[아차상 당첨]</b> <b>{prize:,}원</b>을 획득하셨습니다."
-        else:  # 나머지 18.0% 확률 (821 ~ 1000까지 180개)
+        else:  # 18.0% 확률
             prize = 100
             result_text = f"🪙 <b>[아차상 당첨]</b> <b>{prize:,}원</b>을 획득하셨습니다."
             
@@ -185,9 +192,9 @@ async def handle_korean_commands(update: Update, context: ContextTypes.DEFAULT_T
             parse_mode="HTML"
         )
 
-    # 4. 🏆 /랭킹 명령어 시스템 (보유 자산 포인트 기준 상위 10명)
+    # 4. 🏆 /랭킹 명령어 시스템
     elif text == "/랭킹":
-        ranked_users = sorted(db.items(), key=lambda x: x[1].get("money", 0), reverse=True)[:10]
+        ranked_users = sorted(db.items(), key=lambda x: x.get("money", 0), reverse=True)[:10]
         rank_msg = "🏆 <b>써니호 실시간 포인트 랭킹 TOP 10</b> 🏆\n━━━━━━━━━━━━━━━━━━\n"
         
         medal_emojis = {1: "🥇", 2: "🥈", 3: "🥉"}
@@ -199,10 +206,12 @@ async def handle_korean_commands(update: Update, context: ContextTypes.DEFAULT_T
         rank_msg += "━━━━━━━━━━━━━━━━━━"
         await update.message.reply_text(rank_msg, parse_mode="HTML")
 
-    # 5. /돈충전 명령어 (관리자 전용 치트키)
-    elif text.startswith("/돈충전") and user_id == str(ADMIN_ID):
+    # 5. /돈충전 명령어 (두 분 다 작동 가능)
+    elif text.startswith("/돈충전") and user_id in ADMIN_IDS:
         try:
-            add_money = int(text.split()[1]); db[user_id]["money"] += add_money; save_data(db)
+            add_money = int(text.split()[1])
+            db[user_id]["money"] += add_money
+            save_data(db)
             await update.message.reply_text(f"👑 <b>관리자 권한으로 돈을 충전했습니다!</b>\n💵 추가된 금액: <b>{add_money:,}원</b>\n💰 현재 잔액: <b>{db[user_id]['money']:,}원</b>", parse_mode="HTML")
         except: pass
 
@@ -219,3 +228,4 @@ async def handle_korean_commands(update: Update, context: ContextTypes.DEFAULT_T
             f"━━━━━━━━━━━━━━━━━━\n"
             f"👑 등급 명칭: <b>{get_level_title(lvl)}</b>\n"
             f"📊 현재 레벨: <b>Lv.{lvl}</b>\n"
+            f"📈 경험치량: <code>{exp_bar}</code>\n"
