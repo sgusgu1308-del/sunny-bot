@@ -9,7 +9,6 @@ TOKEN = "8901087051:AAHzB6cuZYdMpVn08_BpAI4VNfANu4CWRs4"
 DB_FILE = "sunny_bot_db.json"
 ADMIN_IDS = ["8684501150", "7155379964"]
 
-# 바카라 글로벌 세션 및 카지노 육매 패턴판 기록 배열 초기화
 GAME_STATUS = {"is_running": False, "start_time": None, "round_count": 1, "history_matrix": [], "deck": [], "p_cards": [], "b_cards": [], "active_bets": {}}
 
 def load_data():
@@ -21,20 +20,21 @@ def save_data(data):
     with open(DB_FILE, 'w', encoding='utf-8') as f: json.dump(data, f, ensure_ascii=False, indent=4)
 
 def get_baccarat_score(cards):
-    return sum({"A":1,"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"10":0,"J":0,"Q":0,"K":0}[c.split('_')] for c in cards) % 10
+    return sum({"A":1,"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"10":0,"J":0,"Q":0,"K":0}[c.split('_')[0]] for c in cards) % 10
 
 def display_cards(cards):
     s_map = {"S": "♠️", "H": "♥️", "D": "♦️", "C": "♣️"}
-    return " ".join([f"[ {s_map[c.split('_')]} {c.split('_')} ]" for c in cards])
+    return " ".join([f"[ {s_map[c.split('_')[1]]} {c.split('_')[0]} ]" for c in cards])
 
+# 🚨 문법 에러 원인이던 중괄호 f-string 문제를 일반 더하기(+) 문법으로 완벽 복구했습니다.
 def get_img_url(card):
     r, s = card.split('_')
-    return f"https://github.io{r}_of_{{'S':'spades','H':'hearts','D':'diamonds','C':'clubs'}[s]}.png"
+    s_name = {"S": "spades", "H": "hearts", "D": "diamonds", "C": "clubs"}[s]
+    return "https://github.io" + str(r) + "_of_" + str(s_name) + ".png"
 
-# 카지노 육매 바둑판 모양 패턴 텍스트를 실시간 빌드하는 정밀 함수 (최대 36개 출력 세팅)
 def build_pattern_board():
     if not GAME_STATUS["history_matrix"]: return "아직 진행된 게임 기록이 없습니다."
-    display_list = GAME_STATUS["history_matrix"][-36:] # 화면 도배 방지 최근 36개 컷
+    display_list = GAME_STATUS["history_matrix"][-36:]
     rows = [[] for _ in range(6)]
     for i, emoji in enumerate(display_list): rows[i % 6].append(emoji)
     return "\n".join([" ".join(row) for row in rows])
@@ -52,13 +52,13 @@ async def start_baccarat_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
     GAME_STATUS["b_cards"] = [GAME_STATUS["deck"].pop(), GAME_STATUS["deck"].pop()]
     
     await asyncio.sleep(15)
-    await context.bot.send_photo(chat_id=chat_id, photo=get_img_url(GAME_STATUS['p_cards']), caption=f"🃏 <b>[{GAME_STATUS['round_count']}회차] 15초 경과 (플레이어 1번째 오픈)</b>\n━━━━━━━━━━━━━━━━━━\n👤 플레이어 패: {display_cards([GAME_STATUS['p_cards']])}\n━━━━━━━━━━━━━━━━━━\n💬 다음 카드는 15초 뒤에 공개됩니다.", parse_mode="HTML")
+    await context.bot.send_photo(chat_id=chat_id, photo=get_img_url(GAME_STATUS['p_cards'][0]), caption=f"🃏 <b>[{GAME_STATUS['round_count']}회차] 15초 경과 (플레이어 1번째 오픈)</b>\n━━━━━━━━━━━━━━━━━━\n👤 플레이어 패: {display_cards([GAME_STATUS['p_cards'][0]])}\n━━━━━━━━━━━━━━━━━━\n💬 다음 카드는 15초 뒤에 공개됩니다.", parse_mode="HTML")
     
     await asyncio.sleep(15)
-    await context.bot.send_photo(chat_id=chat_id, photo=get_img_url(GAME_STATUS['b_cards']), caption=f"🃏 <b>[{GAME_STATUS['round_count']}회차] 30초 경과 (뱅커 1번째 오픈)</b>\n━━━━━━━━━━━━━━━━━━\n👤 플레이어 패: {display_cards([GAME_STATUS['p_cards']])}\n👑 뱅커 패: {display_cards([GAME_STATUS['b_cards']])}\n━━━━━━━━━━━━━━━━━━\n💬 다음 카드는 15초 뒤에 공개됩니다.", parse_mode="HTML")
+    await context.bot.send_photo(chat_id=chat_id, photo=get_img_url(GAME_STATUS['b_cards'][0]), caption=f"🃏 <b>[{GAME_STATUS['round_count']}회차] 30초 경과 (뱅커 1번째 오픈)</b>\n━━━━━━━━━━━━━━━━━━\n👤 플레이어 패: {display_cards([GAME_STATUS['p_cards'][0]])}\n👑 뱅커 패: {display_cards([GAME_STATUS['b_cards'][0]])}\n━━━━━━━━━━━━━━━━━━\n💬 다음 카드는 15초 뒤에 공개됩니다.", parse_mode="HTML")
     
     await asyncio.sleep(15)
-    await context.bot.send_photo(chat_id=chat_id, photo=get_img_url(GAME_STATUS['p_cards']), caption=f"🃏 <b>[{GAME_STATUS['round_count']}회차] 45초 경과 (플레이어 2번째 오픈)</b>\n━━━━━━━━━━━━━━━━━━\n👤 플레이어 오픈 패: {display_cards(GAME_STATUS['p_cards'])}\n👑 뱅커 패: {display_cards([GAME_STATUS['b_cards']])}\n━━━━━━━━━━━━━━━━━━\n🚨 <b>주의: 이제부터 배팅이 전면 마감됩니다!</b>", parse_mode="HTML")
+    await context.bot.send_photo(chat_id=chat_id, photo=get_img_url(GAME_STATUS['p_cards'][1]), caption=f"🃏 <b>[{GAME_STATUS['round_count']}회차] 45초 경과 (플레이어 2번째 오픈)</b>\n━━━━━━━━━━━━━━━━━━\n👤 플레이어 오픈 패: {display_cards(GAME_STATUS['p_cards'])}\n👑 뱅커 패: {display_cards([GAME_STATUS['b_cards'][0]])}\n━━━━━━━━━━━━━━━━━━\n🚨 <b>주의: 이제부터 배팅이 전면 마감됩니다!</b>", parse_mode="HTML")
     
     await asyncio.sleep(15)
     p_score, b_score = get_baccarat_score(GAME_STATUS["p_cards"]), get_baccarat_score(GAME_STATUS["b_cards"])
@@ -66,7 +66,6 @@ async def start_baccarat_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
     elif b_score > p_score: winner, payout, code_emoji = "뱅커", 1.95, "🔴"
     else: winner, payout, code_emoji = "타이", 8.0, "🟢"
     
-    # 🔴 실시간 결과 패턴판 배열에 기호 강제 주입 누적
     GAME_STATUS["history_matrix"].append(code_emoji)
     board_str = build_pattern_board()
     
@@ -84,7 +83,7 @@ async def start_baccarat_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
     
     bet_summary_text = "\n".join(summary_results) if summary_results else "이번 회차에 참여한 유저가 없습니다."
     final_msg = f"🏆 <b>써니호 바카라 [{GAME_STATUS['round_count']}회차] 최종 결과</b> 🏆\n━━━━━━━━━━━━━━━━━━\n👤 <b>플레이어 카드:</b> {display_cards(GAME_STATUS['p_cards'])} (<b>{p_score}점</b>)\n👑 <b>뱅커 카드:</b> {display_cards(GAME_STATUS['b_cards'])} (<b>{b_score}점</b>)\n━━━━━━━━━━━━━━━━━━\n🎯 <b>최종 승자:</b> 🎉 <b>[{winner}]</b> 승리! 🎉\n\n📊 <b>실시간 출현 패턴 현황판 (육매)</b>\n<code>{board_str}</code>\n━━━━━━━━━━━━━━━━━━\n📝 <b>테이블 배팅 정산 내역:</b>\n{bet_summary_text}"
-    await context.bot.send_photo(chat_id=chat_id, photo=get_img_url(GAME_STATUS['b_cards']), caption=final_msg, parse_mode="HTML")
+    await context.bot.send_photo(chat_id=chat_id, photo=get_img_url(GAME_STATUS['b_cards'][1]), caption=final_msg, parse_mode="HTML")
     
     GAME_STATUS["is_running"], GAME_STATUS["start_time"], GAME_STATUS["active_bets"] = False, None, {}
     GAME_STATUS["round_count"] += 1
@@ -144,3 +143,4 @@ async def handle_korean_commands(update: Update, context: ContextTypes.DEFAULT_T
         parts = text.split(); count = 1
         if len(parts) >= 2:
             try:
+                count = int(parts[1])
