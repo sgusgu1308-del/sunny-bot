@@ -10,7 +10,7 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 
 TOKEN = "8901087051:AAHzB6cuZYdMpVn08_BpAI4VNfANu4CWRs4"
 DB_FILE = "sunny_bot_db.json"
-ADMIN_ID = "6238716233"  # 관리자 치트키 연동 ID
+ADMIN_IDS = ["7155379964", "8684501150"]
 
 def load_data():
     if os.path.exists(DB_FILE):
