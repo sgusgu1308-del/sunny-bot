@@ -38,10 +38,12 @@ async def handle_korean_commands(update: Update, context: ContextTypes.DEFAULT_T
     if user_id not in db:
         db[user_id] = {"name": user_name, "money": 0, "count": 0, "last_check": ""}
 
-    # 1. /출석 명령어
+    #     # 1. /출석 명령어
     if text == "/출석":
-        from datetime import datetime
-        today = datetime.now().strftime("%Y-%m-%d")
+        from datetime import datetime, timezone, timedelta
+        kor_tz = timezone(timedelta(hours=9))
+        today = datetime.now(kor_tz).strftime("%Y-%m-%d")
+
         
         # 오늘 이미 출석했는지 확인
         if db[user_id]["last_check"] == today:
