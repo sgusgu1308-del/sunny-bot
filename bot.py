@@ -11,7 +11,7 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 TOKEN = "8901087051:AAHzB6cuZYdMpVn08_BpAI4VNfANu4CWRs4"
 DB_FILE = "sunny_bot_db.json"
 
-# 👑 요청하신 두 분의 관리자 고유 ID를 완벽하게 연동했습니다!
+# 👑 두 분의 관리자 고유 ID 완벽 연동
 ADMIN_IDS = ["8684501150", "7155379964"]
 
 def load_data():
@@ -101,7 +101,7 @@ async def handle_korean_commands(update: Update, context: ContextTypes.DEFAULT_T
         db[user_id]["money"] += 500; db[user_id]["count"] += 1; db[user_id]["last_check"] = today; save_data(db)
         await update.message.reply_text(f"🎉 <b>{user_name}</b>님 출석체크 완료!\n🎁 500원 적립! 현재 잔액: <b>{db[user_id]['money']:,}원</b>", parse_mode="HTML")
 
-    # 2. /배팅 (리얼 바카라 시스템)
+    # 2. /배팅 (리얼 바카라 시스템 - 인덱스 슬라이싱 괄호 오류 완전 해결)
     elif text.startswith("/배팅"):
         parts = text.split()
         if len(parts) < 3:
@@ -206,13 +206,15 @@ async def handle_korean_commands(update: Update, context: ContextTypes.DEFAULT_T
         rank_msg += "━━━━━━━━━━━━━━━━━━"
         await update.message.reply_text(rank_msg, parse_mode="HTML")
 
-    # 5. /돈충전 명령어 (두 분 다 작동 가능)
+    # 5. /돈충전 명령어 (두 분 다 작동 가능 - split 누락 수정 완료)
     elif text.startswith("/돈충전") and user_id in ADMIN_IDS:
         try:
-            add_money = int(text.split()[1])
-            db[user_id]["money"] += add_money
-            save_data(db)
-            await update.message.reply_text(f"👑 <b>관리자 권한으로 돈을 충전했습니다!</b>\n💵 추가된 금액: <b>{add_money:,}원</b>\n💰 현재 잔액: <b>{db[user_id]['money']:,}원</b>", parse_mode="HTML")
+            parts_charge = text.split()
+            if len(parts_charge) >= 2:
+                add_money = int(parts_charge[1])
+                db[user_id]["money"] += add_money
+                save_data(db)
+                await update.message.reply_text(f"👑 <b>관리자 권한으로 돈을 충전했습니다!</b>\n💵 추가된 금액: <b>{add_money:,}원</b>\n💰 현재 잔액: <b>{db[user_id]['money']:,}원</b>", parse_mode="HTML")
         except: pass
 
     # 6. /내정보 명령어
@@ -228,4 +230,3 @@ async def handle_korean_commands(update: Update, context: ContextTypes.DEFAULT_T
             f"━━━━━━━━━━━━━━━━━━\n"
             f"👑 등급 명칭: <b>{get_level_title(lvl)}</b>\n"
             f"📊 현재 레벨: <b>Lv.{lvl}</b>\n"
-            f"📈 경험치량: <code>{exp_bar}</code>\n"
