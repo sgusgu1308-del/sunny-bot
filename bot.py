@@ -1,215 +1,299 @@
-import logging
-import json
 import os
 import random
+import sqlite3
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
+from threading import Thread
+from flask import Flask
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# 로그 설정 (봇 상태 모니터링)
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# ==========================================
+# 1. RENDER 웹서버 속이기용 Flask 설정 (서버 다운 방지)
+# ==========================================
+web_app = Flask('')
 
-TOKEN = "8901087051:AAHzB6cuZYdMpVn08_BpAI4VNfANu4CWRs4"
-DB_FILE = "sunny_bot_db.json"
-ADMIN_IDS = ["8684501150", "7155379964"]
+@web_app.route('/')
+def home():
+    return "Telegram Bot is Running Successfully!"
 
-# 바카라 글로벌 세션 및 카지노 육매 패턴판 기록 배열 초기화
-GAME_STATUS = {
-    "is_running": False,
-    "start_time": None,
-    "round_count": 1,
-    "history_matrix": [],
-    "deck": [],
-    "p_cards": [],
-    "b_cards": [],
-    "active_bets": {}
+def run_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    web_app.run(host='0.0.0.0', port=port)
+
+# ==========================================
+# 2. 데이터베이스 초기화 (데이터 평생 보존)
+# ==========================================
+DB_FILE = "bot_data.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    # 유저 테이블
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            points INTEGER DEFAULT 0,
+            xp INTEGER DEFAULT 0,
+            level INTEGER DEFAULT 1,
+            last_attendance TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# 관리자 ID 목록
+ADMIN_IDS = [7155379964, 8684501150]
+
+# 레벨별 칭호 및 한계치
+LEVEL_NAMES = {1: "돌맹이", 2: "동", 3: "은", 4: "골드", 5: "다이아"}
+XP_REQUIREMENTS = {1: 300, 2: 1000, 3: 5000, 4: 10000}
+LEVEL_UP_COSTS = {1: 5000, 2: 10000, 3: 20000, 4: 50000}
+
+# 바카라 전역 변수 관리
+baccarat_game = {
+    "is_betting": False,
+    "bets": {}, # user_id: {"type": "P/B/T", "amount": 0}
+    "time_left": 60
 }
 
-def load_data():
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
+# ==========================================
+# 3. 헬퍼 함수 (DB 연동)
+# ==========================================
+def get_user(user_id, username="유저"):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT points, xp, level, last_attendance FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.cursor.fetchone()
+    if not row:
+        cursor.execute("INSERT INTO users (user_id, username, points, xp, level) VALUES (?, ?, 0, 0, 1)", (user_id, username))
+        conn.commit()
+        points, xp, level, last_attendance = 0, 0, 1, None
+    else:
+        points, xp, level, last_attendance = row
+    conn.close()
+    return {"points": points, "xp": xp, "level": level, "last_attendance": last_attendance}
 
-def save_data(data):
-    with open(DB_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+def update_user(user_id, points=None, xp=None, level=None, last_attendance=None):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    if points is not None:
+        cursor.execute("UPDATE users SET points = ? WHERE user_id = ?", (points, user_id))
+    if xp is not None:
+        cursor.execute("UPDATE users SET xp = ? WHERE user_id = ?", (xp, user_id))
+    if level is not None:
+        cursor.execute("UPDATE users SET level = ? WHERE user_id = ?", (level, user_id))
+    if last_attendance is not None:
+        cursor.execute("UPDATE users SET last_attendance = ? WHERE user_id = ?", (last_attendance, user_id))
+    conn.commit()
+    conn.close()
 
-def get_baccarat_score(cards):
-    card_values = {"A": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "10": 0, "J": 0, "Q": 0, "K": 0}
-    return sum(card_values[c.split('_')[0]] for c in cards) % 10
+# ==========================================
+# 4. 명령어 및 핵심 기능 구현
+# ==========================================
 
-def display_cards(cards):
-    s_map = {"S": "♠️", "H": "♥️", "D": "♦️", "C": "♣️"}
-    return " ".join([f"[ {s_map[c.split('_')[1]]} {c.split('_')[0]} ]" for c in cards])
+# [기능 1] 내 정보 기능
+async def my_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    username = update.effective_user.first_name
+    u = get_user(user_id, username)
+    
+    level_name = LEVEL_NAMES.get(u['level'], "최고 등급")
+    next_xp = XP_REQUIREMENTS.get(u['level'], "MAX")
+    next_cost = LEVEL_UP_COSTS.get(u['level'], "MAX")
+    
+    msg = (
+        f"👤 [{username}] 님의 정보\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🏅 레벨: {u['level']} [{level_name}]\n"
+        f"💰 보유 포인트: {u['points']:,} 원\n"
+        f"✨ 경험치: {u['xp']} / {next_xp}\n"
+        f"🔼 다음 레벨업 비용: {f'{next_cost:,} 원' if isinstance(next_cost, int) else next_cost}"
+    )
+    await update.message.reply_text(msg)
 
-def get_img_url(cards):
-    # 정산 이미지 대표 매핑용 첫 번째 카드 추출
-    r, s = cards[0].split('_')
-    s_name = {"S": "spades", "H": "hearts", "D": "diamonds", "C": "clubs"}[s]
-    return f"https://github.io{r}_of_{s_name}.png"
+# [기능 2] 한국 시간 기준 00시 초기화 출석체크
+async def attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    u = get_user(user_id)
+    
+    # 한국 시간(UTC+9) 계산
+    kr_now = datetime.utcnow() + timedelta(hours=9)
+    today_str = kr_now.strftime("%Y-%m-%d")
+    
+    if u['last_attendance'] == today_str:
+        await update.message.reply_text("❌ 오늘은 이미 출석체크를 완료하셨습니다! 밤 12시(00시) 이후에 다시 시도해 주세요.")
+        return
+        
+    new_points = u['points'] + 1000
+    update_user(user_id, points=new_points, last_attendance=today_str)
+    await update.message.reply_text(f"📆 출석체크 완료! 1,000포인트(원)가 지급되었습니다. (현재: {new_points:,} 원)")
 
-def build_pattern_board():
-    if not GAME_STATUS["history_matrix"]:
-        return "아직 진행된 게임 기록이 없습니다."
-    display_list = GAME_STATUS["history_matrix"][-36:]
-    rows = [[] for _ in range(6)]
-    for i, emoji in enumerate(display_list):
-        rows[i % 6].append(emoji)
-    return "\n".join([" ".join(row) for row in rows])
+# [기능 3] 레벨업 기능
+async def level_up(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    u = get_user(user_id)
+    current_lvl = u['level']
+    
+    if current_lvl >= 5:
+        await update.message.reply_text("👑 이미 최고 레벨인 [다이아] 등급입니다!")
+        return
+        
+    req_xp = XP_REQUIREMENTS[current_lvl]
+    req_cost = LEVEL_UP_COSTS[current_lvl]
+    
+    if u['xp'] < req_xp:
+        await update.message.reply_text(f"❌ 경험치가 부족합니다! ({u['xp']}/{req_xp} 필요)")
+        return
+    if u['points'] < req_cost:
+        await update.message.reply_text(f"❌ 포인트가 부족합니다! ({req_cost:,} 원 필요)")
+        return
+        
+    update_user(user_id, points=u['points'] - req_cost, level=current_lvl + 1)
+    await update.message.reply_text(f"🎉 축하합니다! 레벨업에 성공하여 [{LEVEL_NAMES[current_lvl+1]}] 등급이 되었습니다!")
 
-def get_level_title(level):
-    return {1: "🪨 돌맹이", 2: "🥈 실버", 3: "🥇 골드", 4: "💎 다이아", 5: "🔹 사파이어"}.get(level, "🔹 사파이어")
+# [기능 4] 채팅당 경험치 + 낮은 확률 깜짝 보너스
+async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+    if update.message.text.startswith('/'):
+        return # 명령어는 제외
+        
+    user_id = update.effective_user.id
+    u = get_user(user_id, update.effective_user.first_name)
+    
+    added_xp = 1
+    bonus_triggered = False
+    
+    # 1/10000 ~ 5/10000 확률로 보너스 이벤트 발생 (평균 약 0.03%)
+    if random.random() < 0.0003:
+        bonus_xp = random.randint(50, 100)
+        added_xp += bonus_xp
+        bonus_triggered = True
+        
+    new_xp = u['xp'] + added_xp
+    update_user(user_id, xp=new_xp)
+    
+    if bonus_triggered:
+        await update.message.reply_text(f"🎁 깜짝 축하합니다! 돌발 이벤트로 대량의 경험치 {added_xp-1}XP를 획득하셨습니다! 🎉")
 
-def get_next_exp_required(level):
-    if level == 1: return 1000
-    if level == 2: return 3000
-    return 3000 * (2 ** (level - 2))
+# [기능 5] 복권 기능
+async def buy_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    u = get_user(user_id)
+    
+    cost = 1000
+    if u['points'] < cost:
+        await update.message.reply_text("❌ 복권 구입 비용은 1,000원입니다. 포인트가 부족합니다.")
+        return
+        
+    rand = random.random() * 100 # 0% ~ 100%
+    prize = 0
+    rank = ""
+    
+    if rand < 0.05:
+        rank = "1등 🥇"
+        prize = 50000
+    elif rand < 0.05 + 0.1:
+        rank = "2등 🥈"
+        prize = 30000
+    elif rand < 0.15 + 0.8:
+        rank = "3등 🥉"
+        prize = 10000
+    elif rand < 0.95 + 1.2:
+        rank = "4등 🏅"
+        prize = 7000
+    elif rand < 30.0: # 약 28% 확률로 5등 당첨되도록 알아서 배분
+        rank = "5등 🎗️"
+        prize = random.randint(100, 5000)
+    else:
+        rank = "낙첨 😭"
+        prize = 0
+        
+    new_points = u['points'] - cost + prize
+    update_user(user_id, points=new_points)
+    
+    if prize > 0:
+        await update.message.reply_text(f"🎫 복권 긁기 결과: **[{rank}]** 당첨!! 🎉\n💰 상금 {prize:,}원이 지급되었습니다! (현재: {new_points:,} 원)")
+    else:
+        await update.message.reply_text(f"🎫 복권 긁기 결과: **[{rank}]** 다음 기회에... (현재: {new_points:,} 원)")
 
-# ⏳ 렌더 무료 플랜에서도 무조건 작동하도록 비동기 스레드 풀을 경량화한 1분 중계 타이머
-async def start_baccarat_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    shapes = ["S", "H", "D", "C"]
-    ranks = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
-    GAME_STATUS["deck"] = [f"{r}_{s}" for r in ranks for s in shapes]
-    random.shuffle(GAME_STATUS["deck"])
-    
-    GAME_STATUS["p_cards"] = [GAME_STATUS["deck"].pop(), GAME_STATUS["deck"].pop()]
-    GAME_STATUS["b_cards"] = [GAME_STATUS["deck"].pop(), GAME_STATUS["deck"].pop()]
-    
-    # 15초 경과: 플레이어 1번째 패 공개
-    await asyncio.sleep(15)
-    p_1 = [GAME_STATUS["p_cards"][0]]
-    await context.bot.send_photo(chat_id=chat_id, photo=get_img_url(p_1), caption=f"🃏 <b>[{GAME_STATUS['round_count']}회차] 15초 경과 (플레이어 1번째 오픈)</b>\n━━━━━━━━━━━━━━━━━━\n👤 플레이어 패: {display_cards(p_1)}\n━━━━━━━━━━━━━━━━━━\n💬 다음 카드는 15초 뒤에 공개됩니다.", parse_mode="HTML")
-    
-    # 30초 경과: 뱅커 1번째 패 공개
-    await asyncio.sleep(15)
-    b_1 = [GAME_STATUS["b_cards"][0]]
-    await context.bot.send_photo(chat_id=chat_id, photo=get_img_url(b_1), caption=f"🃏 <b>[{GAME_STATUS['round_count']}회차] 30초 경과 (뱅커 1번째 오픈)</b>\n━━━━━━━━━━━━━━━━━━\n👤 플레이어 패: {display_cards(p_1)}\n👑 뱅커 패: {display_cards(b_1)}\n━━━━━━━━━━━━━━━━━━\n💬 다음 카드는 15초 뒤에 공개됩니다.", parse_mode="HTML")
-    
-    # 45초 경과: 플레이어 2번째 패 공개 및 추가 배팅 완전 마감 안내
-    await asyncio.sleep(15)
-    await context.bot.send_photo(chat_id=chat_id, photo=get_img_url(GAME_STATUS['p_cards']), caption=f"🃏 <b>[{GAME_STATUS['round_count']}회차] 45초 경과 (플레이어 2번째 오픈)</b>\n━━━━━━━━━━━━━━━━━━\n👤 플레이어 오픈 패: {display_cards(GAME_STATUS['p_cards'])}\n👑 뱅커 패: {display_cards(b_1)}\n━━━━━━━━━━━━━━━━━━\n🚨 <b>주의: 이제부터 이번 회차 결과 정산 전까지 배팅이 전면 마감됩니다!</b>", parse_mode="HTML")
-    
-    # 60초 경과: 최종 정산 및 실시간 육매 패턴판 업데이트
-    await asyncio.sleep(15)
-    p_score = get_baccarat_score(GAME_STATUS["p_cards"])
-    b_score = get_baccarat_score(GAME_STATUS["b_cards"])
-    
-    if p_score > b_score: winner, payout, code_emoji = "플레이어", 2.0, "🔵"
-    elif b_score > p_score: winner, payout, code_emoji = "뱅커", 1.95, "🔴"
-    else: winner, payout, code_emoji = "타이", 8.0, "🟢"
-    
-    GAME_STATUS["history_matrix"].append(code_emoji)
-    board_str = build_pattern_board()
-    
-    db = load_data()
-    summary_results = []
-    for u_id, b_info in GAME_STATUS["active_bets"].items():
-        if u_id not in db: continue
-        bet_choice = b_info["choice"]
-        bet_money = b_info["money"]
-        if bet_choice == winner:
-            if winner == "타이" and bet_choice in ["플레이어", "뱅커"]:
-                db[u_id]["money"] += bet_money
-                summary_results.append(f"🤝 {b_info['name']}: 타이 발생으로 금액 {bet_money:,}원 전액 환불")
-            else:
-                win_amount = int(bet_money * payout)
-                db[u_id]["money"] += win_amount
-                summary_results.append(f"🎉 {b_info['name']}: [{bet_choice}] 적중 성공! (+{win_amount:,}원)")
+# [기능 6] 관리자 포인트 지급 / 차감 명령어
+async def admin_give(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if admin_id not in ADMIN_IDS:
+        return
+        
+    try:
+        # 사용법: /지급 유저ID 금액  또는  /지급 금액 (본인에게)
+        args = context.args
+        if len(args) == 1:
+            target_id = admin_id
+            amount = int(args[0])
+        elif len(args) == 2:
+            target_id = int(args[0])
+            amount = int(args[1])
         else:
-            if winner == "타이":
-                db[u_id]["money"] += bet_money
-                summary_results.append(f"🤝 {b_info['name']}: 타이 발생으로 금액 {bet_money:,}원 전액 환불")
-            else:
-                summary_results.append(f"💥 {b_info['name']}: 적중 실패... (-{bet_money:,}원)")
-    save_data(db)
-    
-    bet_summary_text = "\n".join(summary_results) if summary_results else "이번 회차에 참여한 유저가 없습니다."
-    final_msg = f"🏆 <b>써니호 바카라 [{GAME_STATUS['round_count']}회차] 최종 결과</b> 🏆\n━━━━━━━━━━━━━━━━━━\n👤 <b>플레이어 카드:</b> {display_cards(GAME_STATUS['p_cards'])} (<b>{p_score}점</b>)\n👑 <b>뱅커 카드:</b> {display_cards(GAME_STATUS['b_cards'])} (<b>{b_score}점</b>)\n━━━━━━━━━━━━━━━━━━\n🎯 <b>최종 승자:</b> 🎉 <b>[{winner}]</b> 승리! 🎉\n\n📊 <b>실시간 출현 패턴 현황판 (육매)</b>\n<code>{board_str}</code>\n━━━━━━━━━━━━━━━━━━\n📝 <b>테이블 배팅 정산 내역:</b>\n{bet_summary_text}"
-    await context.bot.send_photo(chat_id=chat_id, photo=get_img_url(GAME_STATUS['b_cards']), caption=final_msg, parse_mode="HTML")
-    
-    GAME_STATUS["is_running"] = False
-    GAME_STATUS["start_time"] = None
-    GAME_STATUS["active_bets"] = {}
-    GAME_STATUS["round_count"] += 1
-
-async def handle_korean_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return
-    text = update.message.text.strip()
-    user = update.message.from_user
-    user_id = str(user.id)
-    user_name = user.first_name
-    db = load_data()
-    
-    if user_id not in db:
-        db[user_id] = {"name": user_name, "money": 0, "count": 0, "last_check": "", "level": 1, "exp": 0, "total_chats": 0}
-    if "level" not in db[user_id]: db[user_id]["level"] = 1; db[user_id]["exp"] = 0
-    if "total_chats" not in db[user_id]: db[user_id]["total_chats"] = 0
-
-    is_command = text.startswith("/")
-    if not is_command:
-        db[user_id]["exp"] += 1
-        db[user_id]["total_chats"] += 1
-        current_lvl = db[user_id]["level"]
-        req_exp = get_next_exp_required(current_lvl)
-        if db[user_id]["exp"] >= req_exp and current_lvl < 5:
-            db[user_id]["level"] += 1
-            db[user_id]["exp"] -= req_exp
-            new_lvl = db[user_id]["level"]
-            bonus = {2: 3000, 3: 10000, 4: 20000, 5: 50000}.get(new_lvl, 0)
-            db[user_id]["money"] += bonus
-            save_data(db)
-            await update.message.reply_text(f"🎊 <b>LEVEL UP!</b> 🎊\n━━━━━━━━━━━━━━━━━━\n👤 <b>{user_name}</b>님의 등급이 상승했습니다!\n✨ 현재 등급: <b>{get_level_title(new_lvl)} (Lv.{new_lvl})</b>\n🎁 레벨업 보상금 <b>{bonus:,}원</b>이 지급되었습니다!💰", parse_mode="HTML")
+            await update.message.reply_text("💡 사용법: `/지급 [유저ID] [금액]` 또는 `/지급 [금액]`")
             return
+            
+        t = get_user(target_id)
+        update_user(target_id, points=t['points'] + amount)
+        await update.message.reply_text(f"✅ [{target_id}]님에게 {amount:,}포인트를 지급했습니다. (현재: {t['points'] + amount:,}원)")
+    except Exception as e:
+        await update.message.reply_text("❌ 형식이 올바르지 않습니다.")
+
+async def admin_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if admin_id not in ADMIN_IDS:
+        return
+        
+    try:
+        args = context.args
+        if len(args) == 1:
+            target_id = admin_id
+            amount = int(args[0])
+        elif len(args) == 2:
+            target_id = int(args[0])
+            amount = int(args[1])
         else:
-            save_data(db)
+            await update.message.reply_text("💡 사용법: `/차감 [유저ID] [금액]` 또는 `/차감 [금액]`")
+            return
+            
+        t = get_user(target_id)
+        update_user(target_id, points=max(0, t['points'] - amount))
+        await update.message.reply_text(f"✅ [{target_id}]님에게서 {amount:,}포인트를 빼갔습니다. (현재: {max(0, t['points'] - amount):,}원)")
+    except Exception as e:
+        await update.message.reply_text("❌ 형식이 올바르지 않습니다.")
 
-    # 1. 00시 정각 초기화 일일 출석 기능 (강제 KST 기준 시각 변환 완료)
-    if text == "/출석":
-        kor_tz = timezone(timedelta(hours=9))
-        today = datetime.now(kor_tz).strftime("%Y-%m-%d")
-        if db[user_id]["last_check"] == today:
-            await update.message.reply_text(f"❌ {user_name}님은 오늘 이미 출석체크를 하셨습니다!")
-            return
-        db[user_id]["money"] += 500
-        db[user_id]["count"] += 1
-        db[user_id]["last_check"] = today
-        save_data(db)
-        await update.message.reply_text(f"🎉 <b>{user_name}</b>님 출석체크 완료!\n🎁 500원 적립! 현재 잔액: <b>{db[user_id]['money']:,}원</b>", parse_mode="HTML")
+# ==========================================
+# [기능 7] 1분 주기 순차 카드 오픈 바카라 시스템
+# ==========================================
+def get_card():
+    shapes = ['♠️', '♥️', '♦️', '♣️']
+    numbers = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K']
+    return f"{random.choice(shapes)}{random.choice(numbers)}"
 
-    elif text.startswith("/배팅"):
-        parts = text.split()
-        if len(parts) < 3:
-            await update.message.reply_text("⚠️ <b>바카라 사용법</b>\n<code>/배팅 [플레이어/뱅커/타이] [금액]</code>\n예시: <code>/배팅 플레이어 500</code>", parse_mode="HTML")
-            return
-        bet_choice = parts[1]
-        if bet_choice not in ["플레이어", "뱅커", "타이"]:
-            await update.message.reply_text("⚠️ 배팅 대상은 <b>플레이어, 뱅커, 타이</b> 중에서 골라주세요!", parse_mode="HTML")
-            return
-        try:
-            bet_money = int(parts[2])
-        except ValueError:
-            await update.message.reply_text("⚠️ 배팅 금액은 숫자만 입력해 주세요!")
-            return
-        if bet_money <= 0 or db[user_id]["money"] < bet_money:
-            await update.message.reply_text(f"❌ 잔액이 부족하거나 올바르지 않은 금액입니다. 현재 잔액: {db[user_id]['money']:,}원")
-            return
-
-        # 🚨 마감 10초 전(48초 이후) 배팅 통제 및 거절 차단 로직
-        if GAME_STATUS["is_running"]:
-            elapsed = (datetime.now() - GAME_STATUS["start_time"]).total_seconds()
-            if elapsed >= 48:
-                await update.message.reply_text("🚨 <b>배팅 마감 실패!</b>\n카드가 오픈되기 10초 전이므로 이번 회차 배팅이 마감되었습니다! 다음 회차를 노려주세요.", parse_mode="HTML")
-                return
-
-        db[user_id]["money"] -= bet_money
-        save_data(db)
-        if user_id in GAME_STATUS["active_bets"]:
-            GAME_STATUS["active_bets"][user_id]["money"] += bet_money
+def calc_baccarat_score(cards):
+    score = 0
+    for card in cards:
+        num = card[2:]
+        if num in ['10', 'J', 'Q', 'K']:
+            continue
+        elif num == 'A':
+            score += 1
         else:
-            GAME_STATUS["active_bets"][user_id] = {"choice": bet_choice, "money": bet_money, "name": user_name}
+            score += int(num)
+    return score % 10
 
-        board_str = build_pattern_board()
-        if not GAME_STATUS["is_running"]:
-            GAME_STATUS["is_running"] = True
+async def baccarat_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not baccarat_game["is_betting"]:
+        await update.message.reply_text("🎰 현재 진행 중인 바카라 베팅 기간이 아닙니다. 다음 게임을 기다려주세요.")
+        return
+        
+    try:
+        # /바카라 [플레이어/뱅커/타이] [금액]
+        type_input = context.args[0]
