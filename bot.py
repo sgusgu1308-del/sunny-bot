@@ -81,7 +81,6 @@ game_lock = asyncio.Lock()
 
 # ============================================================
 # Render 웹서버
-# Flask 사용 안 함
 # ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -101,7 +100,6 @@ class HealthHandler(BaseHTTPRequestHandler):
         )
 
     def log_message(self, format, *args):
-        # Render 로그에 HTTP 요청이 계속 찍히는 것을 방지
         return
 
 
@@ -782,6 +780,10 @@ def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 
+# ============================================================
+# 관리자 포인트 지급
+# ============================================================
+
 async def admin_give(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -845,6 +847,10 @@ async def admin_give(
             "또는 /지급 유저ID 금액"
         )
 
+
+# ============================================================
+# 관리자 포인트 차감
+# ============================================================
 
 async def admin_take(
     update: Update,
@@ -911,7 +917,148 @@ async def admin_take(
 
 
 # ============================================================
-# 카드 이미지
+# 관리자 경험치 지급
+# /경험치 유저ID 100
+# /경험치 100  -> 자기 자신에게 지급
+# ============================================================
+
+async def admin_xp_give(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message or not update.effective_user:
+        return
+
+    if not is_admin(update.effective_user.id):
+
+        await update.message.reply_text(
+            "❌ 관리자만 사용할 수 있습니다."
+        )
+
+        return
+
+    try:
+
+        args = context.args
+
+        if len(args) == 1:
+
+            target_id = update.effective_user.id
+            amount = int(args[0])
+
+        elif len(args) == 2:
+
+            target_id = int(args[0])
+            amount = int(args[1])
+
+        else:
+
+            raise ValueError
+
+        if amount <= 0:
+            raise ValueError
+
+        t = get_user(target_id)
+
+        new_xp = t["xp"] + amount
+
+        update_user(
+            target_id,
+            xp=new_xp
+        )
+
+        await update.message.reply_text(
+            f"✅ 경험치 지급 완료\n"
+            f"👤 유저ID: {target_id}\n"
+            f"✨ +{amount:,} XP\n"
+            f"📊 현재 경험치: {new_xp:,} XP"
+        )
+
+    except Exception:
+
+        await update.message.reply_text(
+            "사용법:\n"
+            "/경험치 100\n"
+            "또는\n"
+            "/경험치 유저ID 100"
+        )
+
+
+# ============================================================
+# 관리자 경험치 차감
+# /경험치차감 유저ID 100
+# /경험치차감 100 -> 자기 자신에게 차감
+# ============================================================
+
+async def admin_xp_take(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message or not update.effective_user:
+        return
+
+    if not is_admin(update.effective_user.id):
+
+        await update.message.reply_text(
+            "❌ 관리자만 사용할 수 있습니다."
+        )
+
+        return
+
+    try:
+
+        args = context.args
+
+        if len(args) == 1:
+
+            target_id = update.effective_user.id
+            amount = int(args[0])
+
+        elif len(args) == 2:
+
+            target_id = int(args[0])
+            amount = int(args[1])
+
+        else:
+
+            raise ValueError
+
+        if amount <= 0:
+            raise ValueError
+
+        t = get_user(target_id)
+
+        new_xp = max(
+            0,
+            t["xp"] - amount
+        )
+
+        update_user(
+            target_id,
+            xp=new_xp
+        )
+
+        await update.message.reply_text(
+            f"✅ 경험치 차감 완료\n"
+            f"👤 유저ID: {target_id}\n"
+            f"✨ -{amount:,} XP\n"
+            f"📊 현재 경험치: {new_xp:,} XP"
+        )
+
+    except Exception:
+
+        await update.message.reply_text(
+            "사용법:\n"
+            "/경험치차감 100\n"
+            "또는\n"
+            "/경험치차감 유저ID 100"
+        )
+
+
+# ============================================================
+# 카드
 # ============================================================
 
 SUITS = {
@@ -971,6 +1118,10 @@ def get_font(size, bold=False):
     return ImageFont.load_default()
 
 
+# ============================================================
+# 카드 이미지 생성
+# ============================================================
+
 def create_card_images():
 
     os.makedirs(
@@ -978,21 +1129,21 @@ def create_card_images():
         exist_ok=True
     )
 
-    width = 300
-    height = 420
+    width = 180
+    height = 250
 
     rank_font = get_font(
-        34,
+        26,
         True
     )
 
     suit_font = get_font(
-        34,
+        24,
         True
     )
 
     center_font = get_font(
-        100,
+        65,
         True
     )
 
@@ -1013,27 +1164,27 @@ def create_card_images():
 
         draw.rounded_rectangle(
             (
-                5,
-                5,
-                width - 5,
-                height - 5
+                4,
+                4,
+                width - 4,
+                height - 4
             ),
-            radius=22,
+            radius=15,
             fill=(35, 70, 150),
             outline="white",
-            width=8
+            width=5
         )
 
         draw.rounded_rectangle(
             (
-                24,
-                24,
-                width - 24,
-                height - 24
+                17,
+                17,
+                width - 17,
+                height - 17
             ),
-            radius=14,
+            radius=10,
             outline="white",
-            width=5
+            width=3
         )
 
         draw.text(
@@ -1080,25 +1231,25 @@ def create_card_images():
 
             draw.rounded_rectangle(
                 (
-                    4,
-                    4,
-                    width - 4,
-                    height - 4
+                    3,
+                    3,
+                    width - 3,
+                    height - 3
                 ),
-                radius=22,
+                radius=15,
                 outline="black",
-                width=4
+                width=3
             )
 
             draw.text(
-                (22, 18),
+                (13, 10),
                 rank,
                 font=rank_font,
                 fill=fill
             )
 
             draw.text(
-                (22, 55),
+                (13, 42),
                 symbol,
                 font=suit_font,
                 fill=fill
@@ -1117,8 +1268,8 @@ def create_card_images():
 
             draw.text(
                 (
-                    width - 22,
-                    height - 18
+                    width - 13,
+                    height - 10
                 ),
                 rank,
                 font=rank_font,
@@ -1185,6 +1336,236 @@ def baccarat_score(cards):
         )
         % 10
     )
+
+
+# ============================================================
+# 바카라 결과 이미지 생성
+# ============================================================
+
+def create_baccarat_image(
+    player,
+    banker,
+    result_text=None
+):
+
+    width = 760
+    height = 330
+
+    img = Image.new(
+        "RGB",
+        (width, height),
+        (20, 70, 45)
+    )
+
+    draw = ImageDraw.Draw(img)
+
+    # 바카라 테이블 테두리
+    draw.rounded_rectangle(
+        (
+            8,
+            8,
+            width - 8,
+            height - 8
+        ),
+        radius=25,
+        outline=(210, 170, 70),
+        width=5
+    )
+
+    title_font = get_font(
+        28,
+        True
+    )
+
+    label_font = get_font(
+        22,
+        True
+    )
+
+    score_font = get_font(
+        24,
+        True
+    )
+
+    result_font = get_font(
+        26,
+        True
+    )
+
+    # 제목
+    draw.text(
+        (
+            width // 2,
+            28
+        ),
+        "🎰  B A C C A R A T",
+        font=title_font,
+        fill=(245, 220, 140),
+        anchor="ma"
+    )
+
+    # 카드 크기
+    card_w = 115
+    card_h = 160
+
+    card_gap = 12
+
+    player_x = 120
+    banker_x = 480
+    card_y = 78
+
+    # --------------------------------------------------------
+    # PLAYER
+    # --------------------------------------------------------
+
+    draw.text(
+        (
+            player_x + 65,
+            65
+        ),
+        "PLAYER",
+        font=label_font,
+        fill="white",
+        anchor="ms"
+    )
+
+    # --------------------------------------------------------
+    # BANKER
+    # --------------------------------------------------------
+
+    draw.text(
+        (
+            banker_x + 65,
+            65
+        ),
+        "BANKER",
+        font=label_font,
+        fill="white",
+        anchor="ms"
+    )
+
+    # --------------------------------------------------------
+    # 카드 붙이기
+    # --------------------------------------------------------
+
+    def paste_cards(cards, start_x):
+
+        for index, card in enumerate(cards):
+
+            card_img = Image.open(
+                card["file"]
+            ).convert("RGB")
+
+            card_img.thumbnail(
+                (
+                    card_w,
+                    card_h
+                )
+            )
+
+            x = (
+                start_x
+                + index * (card_w + card_gap)
+            )
+
+            y = card_y
+
+            img.paste(
+                card_img,
+                (x, y)
+            )
+
+    paste_cards(
+        player,
+        player_x
+    )
+
+    paste_cards(
+        banker,
+        banker_x
+    )
+
+    # 점수
+    player_score = baccarat_score(
+        player
+    )
+
+    banker_score = baccarat_score(
+        banker
+    )
+
+    draw.text(
+        (
+            player_x + 65,
+            255
+        ),
+        f"PLAYER  {player_score}",
+        font=score_font,
+        fill="white",
+        anchor="ma"
+    )
+
+    draw.text(
+        (
+            banker_x + 65,
+            255
+        ),
+        f"BANKER  {banker_score}",
+        font=score_font,
+        fill="white",
+        anchor="ma"
+    )
+
+    if result_text:
+
+        draw.text(
+            (
+                width // 2,
+                300
+            ),
+            result_text,
+            font=result_font,
+            fill=(255, 225, 100),
+            anchor="mm"
+        )
+
+    path = os.path.join(
+        CARD_DIR,
+        "baccarat_result.png"
+    )
+
+    img.save(
+        path,
+        quality=95
+    )
+
+    return path
+
+
+async def send_baccarat_image(
+    bot,
+    chat_id,
+    player,
+    banker,
+    caption=None
+):
+
+    path = create_baccarat_image(
+        player,
+        banker,
+        caption
+    )
+
+    with open(
+        path,
+        "rb"
+    ) as f:
+
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=InputFile(f),
+            caption=caption
+        )
 
 
 # ============================================================
@@ -1311,25 +1692,6 @@ async def baccarat_bet(
     )
 
 
-async def send_card(
-    bot,
-    chat_id,
-    card,
-    caption
-):
-
-    with open(
-        card["file"],
-        "rb"
-    ) as f:
-
-        await bot.send_photo(
-            chat_id=chat_id,
-            photo=InputFile(f),
-            caption=caption
-        )
-
-
 # ============================================================
 # 바카라 게임
 # ============================================================
@@ -1357,64 +1719,39 @@ async def play_baccarat(
     player = []
     banker = []
 
+    # --------------------------------------------------------
+    # 첫 4장
+    # --------------------------------------------------------
+
+    player.append(
+        deck.pop()
+    )
+
+    banker.append(
+        deck.pop()
+    )
+
+    player.append(
+        deck.pop()
+    )
+
+    banker.append(
+        deck.pop()
+    )
+
     await bot.send_message(
         chat_id=chat_id,
-        text=(
-            "🎰 바카라 시작!\n"
-            "🂠 카드를 한 장씩 공개합니다."
-        )
+        text="🎰 바카라 시작!\n🃏 카드를 확인합니다."
     )
 
     await asyncio.sleep(1)
 
-    player.append(
-        deck.pop()
-    )
-
-    await send_card(
+    await send_baccarat_image(
         bot,
         chat_id,
-        player[-1],
-        "👤 PLAYER - 첫 번째 카드"
-    )
-
-    await asyncio.sleep(1)
-
-    banker.append(
-        deck.pop()
-    )
-
-    await send_card(
-        bot,
-        chat_id,
-        banker[-1],
-        "🏦 BANKER - 첫 번째 카드"
-    )
-
-    await asyncio.sleep(1)
-
-    player.append(
-        deck.pop()
-    )
-
-    await send_card(
-        bot,
-        chat_id,
-        player[-1],
-        "👤 PLAYER - 두 번째 카드"
-    )
-
-    await asyncio.sleep(1)
-
-    banker.append(
-        deck.pop()
-    )
-
-    await send_card(
-        bot,
-        chat_id,
-        banker[-1],
-        "🏦 BANKER - 두 번째 카드"
+        player,
+        banker,
+        "🎰 바카라"
     )
 
     player_score = baccarat_score(
@@ -1435,7 +1772,7 @@ async def play_baccarat(
     ):
 
         # ----------------------------------------------------
-        # Player 세 번째 카드
+        # PLAYER 세 번째 카드
         # ----------------------------------------------------
 
         if player_score <= 5:
@@ -1446,17 +1783,18 @@ async def play_baccarat(
 
             await asyncio.sleep(1)
 
-            await send_card(
+            await send_baccarat_image(
                 bot,
                 chat_id,
-                player[-1],
-                "👤 PLAYER - 세 번째 카드"
+                player,
+                banker,
+                "🎰 PLAYER 세 번째 카드"
             )
 
             await asyncio.sleep(1)
 
         # ----------------------------------------------------
-        # Banker 세 번째 카드
+        # BANKER 세 번째 카드
         # ----------------------------------------------------
 
         if len(player) == 2:
@@ -1467,11 +1805,14 @@ async def play_baccarat(
                     deck.pop()
                 )
 
-                await send_card(
+                await asyncio.sleep(1)
+
+                await send_baccarat_image(
                     bot,
                     chat_id,
-                    banker[-1],
-                    "🏦 BANKER - 세 번째 카드"
+                    player,
+                    banker,
+                    "🎰 BANKER 세 번째 카드"
                 )
 
         else:
@@ -1523,11 +1864,14 @@ async def play_baccarat(
                     deck.pop()
                 )
 
-                await send_card(
+                await asyncio.sleep(1)
+
+                await send_baccarat_image(
                     bot,
                     chat_id,
-                    banker[-1],
-                    "🏦 BANKER - 세 번째 카드"
+                    player,
+                    banker,
+                    "🎰 BANKER 세 번째 카드"
                 )
 
     # --------------------------------------------------------
@@ -1557,7 +1901,19 @@ async def play_baccarat(
         result = "T"
         result_text = "🤝 TIE!"
 
+    # --------------------------------------------------------
+    # 최종 바카라 이미지
+    # --------------------------------------------------------
+
     await asyncio.sleep(1)
+
+    await send_baccarat_image(
+        bot,
+        chat_id,
+        player,
+        banker,
+        result_text
+    )
 
     await bot.send_message(
         chat_id=chat_id,
@@ -1576,6 +1932,8 @@ async def play_baccarat(
 
     lines = []
 
+    xp_lines = []
+
     for user_id, bet in bets.items():
 
         bet_type = bet["type"]
@@ -1584,6 +1942,10 @@ async def play_baccarat(
 
         payout = 0
         message = ""
+
+        # ----------------------------------------------------
+        # 승리
+        # ----------------------------------------------------
 
         if bet_type == result:
 
@@ -1600,6 +1962,26 @@ async def play_baccarat(
                 f"+{payout:,}P"
             )
 
+            # 승리자 XP +1
+            u = get_user(
+                user_id
+            )
+
+            update_user(
+                user_id,
+                points=u["points"] + payout,
+                xp=u["xp"] + 1
+            )
+
+            xp_lines.append(
+                f"✨ {username}: +1 XP"
+            )
+
+        # ----------------------------------------------------
+        # TIE 발생 시 PLAYER/BANKER 베팅 반환
+        # XP는 없음
+        # ----------------------------------------------------
+
         elif (
             result == "T"
             and bet_type in ("P", "B")
@@ -1612,8 +1994,6 @@ async def play_baccarat(
                 f"{payout:,}P 반환"
             )
 
-        if payout > 0:
-
             u = get_user(
                 user_id
             )
@@ -1623,9 +2003,34 @@ async def play_baccarat(
                 points=u["points"] + payout
             )
 
-            lines.append(
-                message
+        # ----------------------------------------------------
+        # 패배
+        # ----------------------------------------------------
+
+        else:
+
+            u = get_user(
+                user_id
             )
+
+            # 패배자 XP -1
+            new_xp = max(
+                0,
+                u["xp"] - 1
+            )
+
+            update_user(
+                user_id,
+                xp=new_xp
+            )
+
+            xp_lines.append(
+                f"💥 {username}: -1 XP"
+            )
+
+    # --------------------------------------------------------
+    # 포인트 정산 메시지
+    # --------------------------------------------------------
 
     if lines:
 
@@ -1645,6 +2050,21 @@ async def play_baccarat(
             text=(
                 "💰 이번 게임 "
                 "당첨자가 없습니다."
+            )
+        )
+
+    # --------------------------------------------------------
+    # 바카라 XP 정산
+    # --------------------------------------------------------
+
+    if xp_lines:
+
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "✨ 바카라 경험치 결과\n"
+                "━━━━━━━━━━━━━━\n"
+                + "\n".join(xp_lines)
             )
         )
 
@@ -1724,7 +2144,16 @@ async def help_command(
         "/베팅 P 1000 - PLAYER\n"
         "/베팅 B 1000 - BANKER\n"
         "/베팅 T 1000 - TIE\n\n"
-        "💬 일반 채팅으로 XP 획득"
+        "💬 일반 채팅으로 XP 획득\n\n"
+        "👑 관리자 명령어\n"
+        "/지급 금액\n"
+        "/지급 유저ID 금액\n"
+        "/차감 금액\n"
+        "/차감 유저ID 금액\n"
+        "/경험치 금액\n"
+        "/경험치 유저ID 금액\n"
+        "/경험치차감 금액\n"
+        "/경험치차감 유저ID 금액"
     )
 
 
@@ -1759,6 +2188,11 @@ async def korean_commands(
         "/도움말": help_command,
         "/지급": admin_give,
         "/차감": admin_take,
+
+        # 관리자 경험치
+        "/경험치": admin_xp_give,
+        "/경험치차감": admin_xp_take,
+
         "/베팅": baccarat_bet,
     }
 
@@ -1808,7 +2242,6 @@ def main():
         "================================"
     )
 
-    # Render용 웹서버
     web_thread = Thread(
         target=run_web_server,
         daemon=True
@@ -1834,7 +2267,7 @@ def main():
     application.add_handler(
         MessageHandler(
             filters.Regex(
-                r"^/(내정보|출석|레벨업|복권|바카라|도움말|지급|차감|베팅)(?:\s+.*)?$"
+                r"^/(내정보|출석|레벨업|복권|바카라|도움말|지급|차감|경험치|경험치차감|베팅)(?:\s+.*)?$"
             ),
             korean_commands
         ),
