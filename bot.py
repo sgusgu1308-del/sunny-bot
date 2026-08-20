@@ -98,6 +98,13 @@ class PGConnection:
     def cursor(self):
         return PGCursor(self._connection.cursor())
 
+    def execute(self, sql, params=None):
+        # SQLite처럼 conn.execute(...)를 사용할 수 있게 하는 호환 메서드
+        return self.cursor().execute(sql, params)
+
+    def executemany(self, sql, seq):
+        return self.cursor().executemany(sql, seq)
+
     def commit(self):
         return self._connection.commit()
 
