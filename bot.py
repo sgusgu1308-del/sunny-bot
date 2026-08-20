@@ -8,7 +8,6 @@ from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from PIL import Image, ImageDraw, ImageFont
-
 from telegram import Update, InputFile
 from telegram.ext import (
     ApplicationBuilder,
@@ -18,61 +17,58 @@ from telegram.ext import (
     filters,
 )
 
-
 # ============================================================
-# 기본 설정
+# 써니호 봇 - 통합 전체 코드
+#
+# 기존 기능:
+# - 포인트 / 실머니 완전 분리
+# - 출석 / 레벨 / XP / 레벨업 보상
+# - 복권
+# - 바카라
+# - 홀짝 + 15초 GIF 연출
+# - 포인트/실머니 베팅
+# - 관리자 포인트/실머니/XP 지급 및 차감
+#
+# 추가 기능:
+# - 5글자 이상 일반 채팅만 채팅 횟수 집계
+# - 오늘 채팅 횟수
+# - 누적 채팅 횟수
+# - /내정보에 채팅 횟수 표시
+# - /채팅순위 1~5위
+# - DB에 저장하므로 봇 재시작 후에도 기록 유지
+#
+# 중요:
+# 기존 bot_data.db가 있으면 삭제하지 않습니다.
+# 필요한 컬럼/테이블만 자동으로 추가합니다.
 # ============================================================
 
 TOKEN = os.environ.get("BOT_TOKEN")
-
 DB_FILE = "bot_data.db"
 CARD_DIR = "cards"
-
 KR_TZ = ZoneInfo("Asia/Seoul")
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN 환경변수가 없습니다.")
 
 ADMIN_IDS = set()
-
 for value in os.environ.get("ADMIN_IDS", "").split(","):
     value = value.strip()
     if value.isdigit():
         ADMIN_IDS.add(int(value))
 
+LEVEL_NAMES = {1: "돌맹이", 2: "동", 3: "은", 4: "골드", 5: "다이아"}
+XP_REQUIREMENTS = {1: 300, 2: 1000, 3: 5000, 4: 10000}
+LEVEL_UP_REWARDS = {1: 5000, 2: 10000, 3: 20000, 4: 50000}
 
-# ============================================================
-# 레벨 설정
-# ============================================================
-
-LEVEL_NAMES = {
-    1: "돌맹이",
-    2: "동",
-    3: "은",
-    4: "골드",
-    5: "다이아",
-}
-
-XP_REQUIREMENTS = {
-    1: 300,
-    2: 1000,
-    3: 5000,
-    4: 10000,
-}
-
-LEVEL_UP_REWARDS = {
-    1: 5000,
-    2: 10000,
-    3: 20000,
-    4: 50000,
-}
-
-
-# ============================================================
-# 바카라 상태
-# ============================================================
+# -------------------- 게임 상태 --------------------
 
 baccarat_game = {
+    "active": False,
+    "bets": {},
+    "chat_id": None,
+}
+
+odd_even_game = {
     "active": False,
     "bets": {},
     "chat_id": None,
@@ -81,59 +77,35 @@ baccarat_game = {
 baccarat_history = []
 MAX_HISTORY = 20
 
-db_lock = asyncio.Lock()
 game_lock = asyncio.Lock()
+odd_even_lock = asyncio.Lock()
+db_lock = asyncio.Lock()
 
-
-# ============================================================
-# Render 웹서버
-# ============================================================
+# -------------------- Render 웹서버 --------------------
 
 class HealthHandler(BaseHTTPRequestHandler):
-
     def do_GET(self):
         self.send_response(200)
-        self.send_header(
-            "Content-Type",
-            "text/plain; charset=utf-8"
-        )
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(
-            b"Telegram Bot is Running Successfully!"
-        )
+        self.wfile.write(b"Telegram Bot is Running Successfully!")
 
     def log_message(self, format, *args):
         return
 
-
 def run_web_server():
     port = int(os.environ.get("PORT", "8080"))
-
-    server = HTTPServer(
-        ("0.0.0.0", port),
-        HealthHandler
-    )
-
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
     print(f"Web server running on port {port}")
     server.serve_forever()
 
-
-# ============================================================
-# SQLite
-# ============================================================
+# -------------------- DB --------------------
 
 def db_connect():
-    conn = sqlite3.connect(
-        DB_FILE,
-        timeout=20,
-        check_same_thread=False
-    )
-
+    conn = sqlite3.connect(DB_FILE, timeout=20, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=20000")
-
     return conn
-
 
 def init_db():
     conn = db_connect()
@@ -143,186 +115,156 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             username TEXT DEFAULT '유저',
             points INTEGER DEFAULT 0,
+            real_money INTEGER DEFAULT 0,
             xp INTEGER DEFAULT 0,
             level INTEGER DEFAULT 1,
             last_attendance TEXT
         )
     """)
 
+    # 기존 users 테이블에 필요한 컬럼만 추가
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+
+    if "real_money" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN real_money INTEGER DEFAULT 0")
+
+    if "total_chat_count" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN total_chat_count INTEGER DEFAULT 0")
+
+    # 날짜별 채팅 기록.
+    # 봇 재시작/재배포 후에도 DB가 보존되어 있으면 그대로 이어짐.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS daily_chat (
+            user_id INTEGER NOT NULL,
+            chat_date TEXT NOT NULL,
+            chat_count INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, chat_date)
+        )
+    """)
+
     conn.commit()
     conn.close()
 
-
 init_db()
-
-
-# ============================================================
-# 사용자 조회
-# ============================================================
 
 def get_user(user_id, username="유저"):
     conn = db_connect()
     cur = conn.cursor()
-
     cur.execute("""
-        SELECT
-            user_id,
-            username,
-            points,
-            xp,
-            level,
-            last_attendance
-        FROM users
-        WHERE user_id = ?
+        SELECT user_id, username, points, real_money, xp, level,
+               last_attendance, total_chat_count
+        FROM users WHERE user_id = ?
     """, (user_id,))
-
     row = cur.fetchone()
 
     if row is None:
         cur.execute("""
             INSERT INTO users
-            (
-                user_id,
-                username,
-                points,
-                xp,
-                level,
-                last_attendance
-            )
-            VALUES (?, ?, 0, 0, 1, NULL)
+            (user_id, username, points, real_money, xp, level,
+             last_attendance, total_chat_count)
+            VALUES (?, ?, 0, 0, 0, 1, NULL, 0)
         """, (user_id, username))
-
         conn.commit()
-
         result = {
             "user_id": user_id,
             "username": username,
             "points": 0,
+            "real_money": 0,
             "xp": 0,
             "level": 1,
             "last_attendance": None,
+            "total_chat_count": 0,
         }
-
     else:
         result = {
             "user_id": row[0],
             "username": row[1],
-            "points": row[2],
-            "xp": row[3],
-            "level": row[4],
-            "last_attendance": row[5],
+            "points": row[2] or 0,
+            "real_money": row[3] or 0,
+            "xp": row[4] or 0,
+            "level": row[5] or 1,
+            "last_attendance": row[6],
+            "total_chat_count": row[7] or 0,
         }
-
         if username and username != row[1]:
-            cur.execute("""
-                UPDATE users
-                SET username = ?
-                WHERE user_id = ?
-            """, (username, user_id))
+            cur.execute(
+                "UPDATE users SET username=? WHERE user_id=?",
+                (username, user_id)
+            )
             conn.commit()
 
     conn.close()
     return result
 
-
-# ============================================================
-# 사용자 수정
-# ============================================================
-
 def update_user(
     user_id,
     points=None,
+    real_money=None,
     xp=None,
     level=None,
-    last_attendance=None
+    last_attendance=None,
+    total_chat_count=None
 ):
     conn = db_connect()
     cur = conn.cursor()
 
     if points is not None:
-        cur.execute("""
-            UPDATE users
-            SET points = ?
-            WHERE user_id = ?
-        """, (points, user_id))
-
+        cur.execute("UPDATE users SET points=? WHERE user_id=?", (points, user_id))
+    if real_money is not None:
+        cur.execute("UPDATE users SET real_money=? WHERE user_id=?", (real_money, user_id))
     if xp is not None:
-        cur.execute("""
-            UPDATE users
-            SET xp = ?
-            WHERE user_id = ?
-        """, (xp, user_id))
-
+        cur.execute("UPDATE users SET xp=? WHERE user_id=?", (xp, user_id))
     if level is not None:
-        cur.execute("""
-            UPDATE users
-            SET level = ?
-            WHERE user_id = ?
-        """, (level, user_id))
-
+        cur.execute("UPDATE users SET level=? WHERE user_id=?", (level, user_id))
     if last_attendance is not None:
-        cur.execute("""
-            UPDATE users
-            SET last_attendance = ?
-            WHERE user_id = ?
-        """, (last_attendance, user_id))
+        cur.execute(
+            "UPDATE users SET last_attendance=? WHERE user_id=?",
+            (last_attendance, user_id)
+        )
+    if total_chat_count is not None:
+        cur.execute(
+            "UPDATE users SET total_chat_count=? WHERE user_id=?",
+            (total_chat_count, user_id)
+        )
 
     conn.commit()
     conn.close()
 
-
-# ============================================================
-# XP 지급 후 자동 레벨업
-# ============================================================
-
 def add_xp_and_check_level(user_id, amount):
     conn = db_connect()
     cur = conn.cursor()
-
-    cur.execute("""
-        SELECT xp, level, points
-        FROM users
-        WHERE user_id = ?
-    """, (user_id,))
-
+    cur.execute(
+        "SELECT xp, level, points FROM users WHERE user_id=?",
+        (user_id,)
+    )
     row = cur.fetchone()
 
     if row is None:
         conn.close()
         return None
 
-    xp = row[0]
-    level = row[1]
-    points = row[2]
-
+    xp, level, points = row
     xp = max(0, xp + amount)
-    level_up_messages = []
+    level_ups = []
 
     while level < 5:
-        required_xp = XP_REQUIREMENTS.get(level)
+        required = XP_REQUIREMENTS.get(level)
         reward = LEVEL_UP_REWARDS.get(level, 0)
 
-        if required_xp is None:
-            break
-
-        if xp < required_xp:
+        if required is None or xp < required:
             break
 
         level += 1
         points += reward
-
-        level_up_messages.append({
+        level_ups.append({
             "level": level,
             "reward": reward
         })
 
     cur.execute("""
         UPDATE users
-        SET
-            xp = ?,
-            level = ?,
-            points = ?
-        WHERE user_id = ?
+        SET xp=?, level=?, points=?
+        WHERE user_id=?
     """, (xp, level, points, user_id))
 
     conn.commit()
@@ -332,22 +274,121 @@ def add_xp_and_check_level(user_id, amount):
         "xp": xp,
         "level": level,
         "points": points,
-        "level_ups": level_up_messages
+        "level_ups": level_ups
     }
 
+# -------------------- 채팅 횟수 --------------------
 
-# ============================================================
-# 내정보
-# ============================================================
+def count_chat_message(user_id, username, text):
+    """
+    5글자 이상 일반 메시지만 집계.
+    공백은 제외해서 실제 글자 수를 판단합니다.
+    명령어는 handle_chat에서 이미 제외됩니다.
+    """
+    if not text:
+        return False, 0, 0
+
+    clean_text = "".join(text.split())
+
+    if len(clean_text) < 5:
+        return False, 0, 0
+
+    today = datetime.now(KR_TZ).strftime("%Y-%m-%d")
+
+    conn = db_connect()
+    cur = conn.cursor()
+
+    # 사용자가 DB에 없으면 생성
+    cur.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+    if cur.fetchone() is None:
+        cur.execute("""
+            INSERT INTO users
+            (user_id, username, points, real_money, xp, level,
+             last_attendance, total_chat_count)
+            VALUES (?, ?, 0, 0, 0, 1, NULL, 0)
+        """, (user_id, username))
+    else:
+        cur.execute(
+            "UPDATE users SET username=? WHERE user_id=?",
+            (username, user_id)
+        )
+
+    # 누적 채팅 +1
+    cur.execute("""
+        UPDATE users
+        SET total_chat_count = COALESCE(total_chat_count, 0) + 1
+        WHERE user_id=?
+    """, (user_id,))
+
+    # 오늘 채팅 +1
+    cur.execute("""
+        INSERT INTO daily_chat (user_id, chat_date, chat_count)
+        VALUES (?, ?, 1)
+        ON CONFLICT(user_id, chat_date)
+        DO UPDATE SET chat_count = daily_chat.chat_count + 1
+    """, (user_id, today))
+
+    cur.execute(
+        "SELECT total_chat_count FROM users WHERE user_id=?",
+        (user_id,)
+    )
+    total = cur.fetchone()[0] or 0
+
+    cur.execute("""
+        SELECT chat_count
+        FROM daily_chat
+        WHERE user_id=? AND chat_date=?
+    """, (user_id, today))
+    today_count = cur.fetchone()[0] or 0
+
+    conn.commit()
+    conn.close()
+
+    return True, today_count, total
+
+def get_today_chat_count(user_id):
+    today = datetime.now(KR_TZ).strftime("%Y-%m-%d")
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT chat_count
+        FROM daily_chat
+        WHERE user_id=? AND chat_date=?
+    """, (user_id, today))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+def get_chat_ranking(limit=5):
+    today = datetime.now(KR_TZ).strftime("%Y-%m-%d")
+
+    conn = db_connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT u.user_id,
+               u.username,
+               COALESCE(d.chat_count, 0) AS today_count
+        FROM users u
+        LEFT JOIN daily_chat d
+          ON u.user_id=d.user_id AND d.chat_date=?
+        WHERE COALESCE(d.chat_count, 0) > 0
+        ORDER BY today_count DESC, u.user_id ASC
+        LIMIT ?
+    """, (today, limit))
+
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+# -------------------- 일반 기능 --------------------
 
 async def my_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user:
         return
 
     user = update.effective_user
-    username = user.first_name or "유저"
-
-    u = get_user(user.id, username)
+    u = get_user(user.id, user.first_name or "유저")
 
     level_name = LEVEL_NAMES.get(u["level"], "최고 등급")
     next_xp = XP_REQUIREMENTS.get(u["level"], "MAX")
@@ -359,87 +400,89 @@ async def my_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else next_reward
     )
 
+    today_chat = get_today_chat_count(user.id)
+
     await update.message.reply_text(
-        f"👤 [{username}] 님의 정보\n"
+        f"👤 [{u['username']}] 님의 정보\n"
         f"━━━━━━━━━━━━━━\n"
         f"🏅 레벨: {u['level']} [{level_name}]\n"
         f"💰 보유 포인트: {u['points']:,}P\n"
-        f"✨ 경험치: {u['xp']} / {next_xp}\n"
-        f"🎁 다음 레벨업 보상: {reward_text}"
+        f"💵 실머니: {u['real_money']:,}원\n"
+        f"✨ 경험치: {u['xp']:,} / {next_xp}\n"
+        f"🎁 다음 레벨업 보상: {reward_text}\n"
+        f"💬 오늘 채팅: {today_chat:,}회\n"
+        f"📚 누적 채팅: {u['total_chat_count']:,}회"
     )
 
+async def chat_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
 
-# ============================================================
-# 출석
-# ============================================================
+    rows = get_chat_ranking(5)
+
+    if not rows:
+        await update.message.reply_text(
+            "💬 오늘 채팅 순위\n"
+            "━━━━━━━━━━━━━━\n"
+            "아직 5글자 이상 채팅을 한 사람이 없습니다."
+        )
+        return
+
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    lines = [
+        "💬 오늘 채팅 순위",
+        "━━━━━━━━━━━━━━"
+    ]
+
+    for i, row in enumerate(rows):
+        user_id, username, count = row
+        display_name = username or f"유저{user_id}"
+        lines.append(
+            f"{medals[i]} {i+1}위  {display_name} — {count:,}회"
+        )
+
+    await update.message.reply_text("\n".join(lines))
 
 async def attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user:
         return
 
-    user_id = update.effective_user.id
+    uid = update.effective_user.id
     username = update.effective_user.first_name or "유저"
-
     today = datetime.now(KR_TZ).strftime("%Y-%m-%d")
 
     async with db_lock:
         conn = db_connect()
         cur = conn.cursor()
 
-        cur.execute("""
-            SELECT points, last_attendance
-            FROM users
-            WHERE user_id = ?
-        """, (user_id,))
-
+        cur.execute(
+            "SELECT points, last_attendance FROM users WHERE user_id=?",
+            (uid,)
+        )
         row = cur.fetchone()
 
         if row is None:
             cur.execute("""
                 INSERT INTO users
-                (
-                    user_id,
-                    username,
-                    points,
-                    xp,
-                    level,
-                    last_attendance
-                )
-                VALUES (?, ?, 1000, 0, 1, ?)
-            """, (user_id, username, today))
+                (user_id, username, points, real_money, xp, level,
+                 last_attendance, total_chat_count)
+                VALUES (?, ?, 1000, 0, 0, 1, ?, 0)
+            """, (uid, username, today))
+            new_points, already = 1000, False
 
-            conn.commit()
-            already = False
-            new_points = 1000
+        elif row[1] == today:
+            new_points, already = row[0], True
 
         else:
-            points = row[0]
-            last_attendance = row[1]
+            new_points = row[0] + 1000
+            cur.execute("""
+                UPDATE users
+                SET points=?, last_attendance=?, username=?
+                WHERE user_id=?
+            """, (new_points, today, username, uid))
+            already = False
 
-            if last_attendance == today:
-                already = True
-                new_points = points
-
-            else:
-                new_points = points + 1000
-
-                cur.execute("""
-                    UPDATE users
-                    SET
-                        points = ?,
-                        last_attendance = ?,
-                        username = ?
-                    WHERE user_id = ?
-                """, (
-                    new_points,
-                    today,
-                    username,
-                    user_id
-                ))
-
-                conn.commit()
-                already = False
-
+        conn.commit()
         conn.close()
 
     if already:
@@ -447,18 +490,12 @@ async def attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ 오늘은 이미 출석체크를 완료했습니다.\n"
             "🌙 한국시간 00:00 이후 다시 출석할 수 있습니다."
         )
-        return
-
-    await update.message.reply_text(
-        f"📆 출석체크 완료!\n"
-        f"🎁 +1,000P 지급\n"
-        f"💰 현재: {new_points:,}P"
-    )
-
-
-# ============================================================
-# 레벨업
-# ============================================================
+    else:
+        await update.message.reply_text(
+            f"📆 출석체크 완료!\n"
+            f"🎁 +1,000P 지급\n"
+            f"💰 현재: {new_points:,}P"
+        )
 
 async def level_up(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user:
@@ -472,82 +509,41 @@ async def level_up(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    required_xp = XP_REQUIREMENTS[u["level"]]
+    required = XP_REQUIREMENTS[u["level"]]
     reward = LEVEL_UP_REWARDS[u["level"]]
 
-    if u["xp"] < required_xp:
-        await update.message.reply_text(
-            f"✨ 레벨업은 자동으로 진행됩니다.\n\n"
-            f"현재: {u['xp']:,} XP\n"
-            f"필요: {required_xp:,} XP\n"
-            f"🎁 레벨업 보상: {reward:,}P"
-        )
-        return
-
-    result = add_xp_and_check_level(
-        u["user_id"],
-        0
+    await update.message.reply_text(
+        f"✨ 레벨업은 자동으로 진행됩니다.\n\n"
+        f"현재: {u['xp']:,} XP\n"
+        f"필요: {required:,} XP\n"
+        f"🎁 레벨업 보상: {reward:,}P"
     )
 
-    if result and result["level_ups"]:
-        text = "🎉 레벨업 완료!\n"
-
-        for item in result["level_ups"]:
-            text += (
-                f"\n🏅 Lv.{item['level']} "
-                f"[{LEVEL_NAMES[item['level']]}]\n"
-                f"🎁 +{item['reward']:,}P 지급"
-            )
-
-        await update.message.reply_text(text)
-
-    else:
-        await update.message.reply_text(
-            "ℹ️ 경험치가 기준에 도달하면 "
-            "자동으로 레벨업됩니다."
-        )
-
-
-# ============================================================
-# 채팅 XP
-# ============================================================
-
 async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
+    if (
+        not update.message
+        or not update.message.text
+        or not update.effective_user
+    ):
         return
 
-    if not update.message.text:
+    if update.message.text.startswith("/"):
         return
 
-    if not update.effective_user:
-        return
-
-    text = update.message.text.strip()
-
-    if text.startswith("/"):
-        return
-
-    user_id = update.effective_user.id
+    uid = update.effective_user.id
     username = update.effective_user.first_name or "유저"
 
-    get_user(user_id, username)
+    get_user(uid, username)
 
-    added_xp = 1
+    # 5글자 이상 메시지만 채팅 횟수에 포함
+    counted, today_count, total_count = count_chat_message(
+        uid,
+        username,
+        update.message.text
+    )
 
-    if random.random() < 0.0003:
-        bonus = random.randint(50, 100)
-        added_xp += bonus
-
-        await update.message.reply_text(
-            f"🎁 깜짝 경험치 이벤트!\n"
-            f"✨ +{bonus} XP 획득!"
-        )
-
-    async with db_lock:
-        result = add_xp_and_check_level(
-            user_id,
-            added_xp
-        )
+    # 기존 XP 시스템 유지
+    result = add_xp_and_check_level(uid, 1)
 
     if result and result["level_ups"]:
         for item in result["level_ups"]:
@@ -555,14 +551,10 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🎉 레벨업!\n"
                 f"🏅 Lv.{item['level']} "
                 f"[{LEVEL_NAMES[item['level']]}]\n"
-                f"🎁 레벨업 보상 "
-                f"+{item['reward']:,}P 지급!"
+                f"🎁 +{item['reward']:,}P 지급!"
             )
 
-
-# ============================================================
-# 복권
-# ============================================================
+# -------------------- 복권 --------------------
 
 def lottery_5th_prize():
     rewards = [
@@ -576,112 +568,82 @@ def lottery_5th_prize():
         (2000, 20),
         (3000, 8),
         (4000, 3),
-        (5000, 1),
+        (5000, 1)
     ]
 
     return random.choices(
-        [r[0] for r in rewards],
-        weights=[r[1] for r in rewards],
+        [x[0] for x in rewards],
+        weights=[x[1] for x in rewards],
         k=1
     )[0]
-
 
 async def buy_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user:
         return
 
-    user_id = update.effective_user.id
+    uid = update.effective_user.id
     username = update.effective_user.first_name or "유저"
-    cost = 1000
 
-    async with db_lock:
-        conn = db_connect()
-        cur = conn.cursor()
+    use_real = bool(
+        context.args
+        and context.args[0] in ("실", "실머니")
+    )
 
-        cur.execute("""
-            SELECT points
-            FROM users
-            WHERE user_id = ?
-        """, (user_id,))
+    cost = 100 if use_real else 1000
 
-        row = cur.fetchone()
+    u = get_user(uid, username)
+    balance = u["real_money"] if use_real else u["points"]
 
-        if row is None:
-            cur.execute("""
-                INSERT INTO users
-                (
-                    user_id,
-                    username,
-                    points,
-                    xp,
-                    level
-                )
-                VALUES (?, ?, 0, 0, 1)
-            """, (user_id, username))
+    if balance < cost:
+        await update.message.reply_text(
+            f"❌ {'실머니' if use_real else '포인트'}가 부족합니다.\n"
+            f"현재: {balance:,}{'원' if use_real else 'P'}"
+        )
+        return
 
-            points = 0
-        else:
-            points = row[0]
+    rand = random.random() * 100
 
-        if points < cost:
-            conn.close()
+    if rand < 0.05:
+        rank, prize = "1등 🥇", 50000
+    elif rand < 0.15:
+        rank, prize = "2등 🥈", 30000
+    elif rand < 0.95:
+        rank, prize = "3등 🥉", 10000
+    elif rand < 2.15:
+        rank, prize = "4등 🏅", 7000
+    else:
+        rank, prize = "5등 🎗️", lottery_5th_prize()
 
-            await update.message.reply_text(
-                f"❌ 복권 가격은 {cost:,}P입니다.\n"
-                f"현재: {points:,}P"
-            )
-            return
-
-        rand = random.random() * 100
-
-        if rand < 0.05:
-            rank = "1등 🥇"
-            prize = 50000
-        elif rand < 0.15:
-            rank = "2등 🥈"
-            prize = 30000
-        elif rand < 0.95:
-            rank = "3등 🥉"
-            prize = 10000
-        elif rand < 2.15:
-            rank = "4등 🏅"
-            prize = 7000
-        else:
-            rank = "5등 🎗️"
-            prize = lottery_5th_prize()
-
-        new_points = points - cost + prize
-
-        cur.execute("""
-            UPDATE users
-            SET
-                points = ?,
-                username = ?
-            WHERE user_id = ?
-        """, (new_points, username, user_id))
-
-        conn.commit()
-        conn.close()
+    if use_real:
+        new_balance = balance - cost + prize
+        update_user(uid, real_money=new_balance)
+        unit = "원"
+    else:
+        new_balance = balance - cost + prize
+        update_user(uid, points=new_balance)
+        unit = "P"
 
     await update.message.reply_text(
         f"🎫 복권 결과\n"
         f"━━━━━━━━━━━━━━\n"
         f"🏆 등수: {rank}\n"
-        f"💰 당첨: {prize:,}P\n"
-        f"💳 구매: -{cost:,}P\n"
-        f"💵 현재: {new_points:,}P"
+        f"💰 당첨: {prize:,}{unit}\n"
+        f"💳 구매: -{cost:,}{unit}\n"
+        f"💵 현재 보유: {new_balance:,}{unit}"
     )
 
+# -------------------- 관리자 --------------------
 
-# ============================================================
-# 관리자
-# ============================================================
+def is_admin(uid):
+    return uid in ADMIN_IDS
 
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
-
-
-async def admin_give(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_balance_change(
+    update,
+    context,
+    field,
+    title,
+    unit
+):
     if not update.message or not update.effective_user:
         return
 
@@ -696,39 +658,47 @@ async def admin_give(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if len(args) == 1:
             target_id = update.effective_user.id
-            amount = int(args[0])
+            amount = int(args[0].replace(",", ""))
+
         elif len(args) == 2:
             target_id = int(args[0])
-            amount = int(args[1])
+            amount = int(args[1].replace(",", ""))
+
         else:
             raise ValueError
 
         if amount <= 0:
             raise ValueError
 
-        t = get_user(target_id)
-        new_points = t["points"] + amount
+        u = get_user(target_id)
+        current = u[field]
+        new_value = current + amount
 
-        update_user(
-            target_id,
-            points=new_points
-        )
+        update_user(target_id, **{field: new_value})
 
         await update.message.reply_text(
-            f"✅ 지급 완료\n"
+            f"✅ {title} 완료\n"
             f"👤 {target_id}\n"
-            f"💰 +{amount:,}P\n"
-            f"💳 현재: {new_points:,}P"
+            f"💰 +{amount:,}{unit}\n"
+            f"💳 현재: {new_value:,}{unit}"
         )
 
     except Exception:
         await update.message.reply_text(
-            "사용법: /지급 금액\n"
-            "또는 /지급 유저ID 금액"
+            f"사용법: /{title} 금액\n"
+            f"또는 /{title} 유저ID 금액"
         )
 
+async def admin_give(update, context):
+    await admin_balance_change(
+        update,
+        context,
+        "points",
+        "지급",
+        "P"
+    )
 
-async def admin_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_take(update, context):
     if not update.message or not update.effective_user:
         return
 
@@ -743,29 +713,28 @@ async def admin_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if len(args) == 1:
             target_id = update.effective_user.id
-            amount = int(args[0])
+            amount = int(args[0].replace(",", ""))
+
         elif len(args) == 2:
             target_id = int(args[0])
-            amount = int(args[1])
+            amount = int(args[1].replace(",", ""))
+
         else:
             raise ValueError
 
         if amount <= 0:
             raise ValueError
 
-        t = get_user(target_id)
-        new_points = max(0, t["points"] - amount)
+        u = get_user(target_id)
+        new_value = max(0, u["points"] - amount)
 
-        update_user(
-            target_id,
-            points=new_points
-        )
+        update_user(target_id, points=new_value)
 
         await update.message.reply_text(
             f"✅ 차감 완료\n"
             f"👤 {target_id}\n"
             f"💸 -{amount:,}P\n"
-            f"💳 현재: {new_points:,}P"
+            f"💳 현재: {new_value:,}P"
         )
 
     except Exception:
@@ -774,8 +743,61 @@ async def admin_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "또는 /차감 유저ID 금액"
         )
 
+async def admin_real_give(update, context):
+    await admin_balance_change(
+        update,
+        context,
+        "real_money",
+        "실머니지급",
+        "원"
+    )
 
-async def admin_xp_give(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_real_take(update, context):
+    if not update.message or not update.effective_user:
+        return
+
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text(
+            "❌ 관리자만 사용할 수 있습니다."
+        )
+        return
+
+    try:
+        args = context.args
+
+        if len(args) == 1:
+            target_id = update.effective_user.id
+            amount = int(args[0].replace(",", ""))
+
+        elif len(args) == 2:
+            target_id = int(args[0])
+            amount = int(args[1].replace(",", ""))
+
+        else:
+            raise ValueError
+
+        if amount <= 0:
+            raise ValueError
+
+        u = get_user(target_id)
+        new_value = max(0, u["real_money"] - amount)
+
+        update_user(target_id, real_money=new_value)
+
+        await update.message.reply_text(
+            f"✅ 실머니 차감 완료\n"
+            f"👤 {target_id}\n"
+            f"💸 -{amount:,}원\n"
+            f"💳 현재: {new_value:,}원"
+        )
+
+    except Exception:
+        await update.message.reply_text(
+            "사용법: /실머니차감 금액\n"
+            "또는 /실머니차감 유저ID 금액"
+        )
+
+async def admin_xp_give(update, context):
     if not update.message or not update.effective_user:
         return
 
@@ -791,9 +813,11 @@ async def admin_xp_give(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(args) == 1:
             target_id = update.effective_user.id
             amount = int(args[0])
+
         elif len(args) == 2:
             target_id = int(args[0])
             amount = int(args[1])
+
         else:
             raise ValueError
 
@@ -801,41 +825,32 @@ async def admin_xp_give(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ValueError
 
         get_user(target_id)
-
-        result = add_xp_and_check_level(
-            target_id,
-            amount
-        )
+        result = add_xp_and_check_level(target_id, amount)
 
         text = (
             f"✅ 경험치 지급 완료\n"
-            f"👤 유저ID: {target_id}\n"
+            f"👤 {target_id}\n"
             f"✨ +{amount:,} XP\n"
-            f"📊 현재 경험치: "
-            f"{result['xp']:,} XP"
+            f"📊 현재: {result['xp']:,} XP"
         )
 
-        if result["level_ups"]:
-            for item in result["level_ups"]:
-                text += (
-                    f"\n\n🎉 자동 레벨업!\n"
-                    f"🏅 Lv.{item['level']} "
-                    f"[{LEVEL_NAMES[item['level']]}]\n"
-                    f"🎁 +{item['reward']:,}P 지급"
-                )
+        for item in result["level_ups"]:
+            text += (
+                f"\n\n🎉 자동 레벨업!\n"
+                f"🏅 Lv.{item['level']} "
+                f"[{LEVEL_NAMES[item['level']}]]\n"
+                f"🎁 +{item['reward']:,}P 지급"
+            )
 
         await update.message.reply_text(text)
 
     except Exception:
         await update.message.reply_text(
-            "사용법:\n"
-            "/경험치 100\n"
-            "또는\n"
-            "/경험치 유저ID 100"
+            "사용법: /경험치 100\n"
+            "또는 /경험치 유저ID 100"
         )
 
-
-async def admin_xp_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_xp_take(update, context):
     if not update.message or not update.effective_user:
         return
 
@@ -851,43 +866,36 @@ async def admin_xp_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(args) == 1:
             target_id = update.effective_user.id
             amount = int(args[0])
+
         elif len(args) == 2:
             target_id = int(args[0])
             amount = int(args[1])
+
         else:
             raise ValueError
 
         if amount <= 0:
             raise ValueError
 
-        t = get_user(target_id)
-        new_xp = max(0, t["xp"] - amount)
+        u = get_user(target_id)
+        new_xp = max(0, u["xp"] - amount)
 
-        update_user(
-            target_id,
-            xp=new_xp
-        )
+        update_user(target_id, xp=new_xp)
 
         await update.message.reply_text(
             f"✅ 경험치 차감 완료\n"
-            f"👤 유저ID: {target_id}\n"
+            f"👤 {target_id}\n"
             f"✨ -{amount:,} XP\n"
-            f"📊 현재 경험치: "
-            f"{new_xp:,} XP"
+            f"📊 현재: {new_xp:,} XP"
         )
 
     except Exception:
         await update.message.reply_text(
-            "사용법:\n"
-            "/경험치차감 100\n"
-            "또는\n"
-            "/경험치차감 유저ID 100"
+            "사용법: /경험치차감 100\n"
+            "또는 /경험치차감 유저ID 100"
         )
 
-
-# ============================================================
-# 카드
-# ============================================================
+# -------------------- 카드 --------------------
 
 SUITS = {
     "S": ("♠", "black"),
@@ -901,24 +909,19 @@ RANKS = [
     "8", "9", "10", "J", "Q", "K"
 ]
 
-
 def get_font(size, bold=False):
     paths = [
         (
             "/usr/share/fonts/truetype/dejavu/"
-            "DejaVuSans-Bold.ttf"
-            if bold
-            else
-            "/usr/share/fonts/truetype/dejavu/"
-            "DejaVuSans.ttf"
+            + ("DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf")
         ),
         (
             "/usr/share/fonts/truetype/liberation2/"
-            "LiberationSans-Bold.ttf"
-            if bold
-            else
-            "/usr/share/fonts/truetype/liberation2/"
-            "LiberationSans-Regular.ttf"
+            + (
+                "LiberationSans-Bold.ttf"
+                if bold
+                else "LiberationSans-Regular.ttf"
+            )
         ),
     ]
 
@@ -928,45 +931,38 @@ def get_font(size, bold=False):
 
     return ImageFont.load_default()
 
-
 def create_card_images():
     os.makedirs(CARD_DIR, exist_ok=True)
 
-    width = 80
-    height = 115
+    width, height = 100, 145
 
-    rank_font = get_font(15, True)
-    suit_font = get_font(14, True)
-    center_font = get_font(32, True)
+    rank_font = get_font(18, True)
+    suit_font = get_font(17, True)
+    center_font = get_font(42, True)
 
     back_path = os.path.join(CARD_DIR, "BACK.png")
 
     if not os.path.exists(back_path):
-        img = Image.new(
-            "RGB",
-            (width, height),
-            "white"
-        )
-
+        img = Image.new("RGB", (width, height), "white")
         draw = ImageDraw.Draw(img)
 
         draw.rounded_rectangle(
-            (2, 2, width - 2, height - 2),
-            radius=8,
+            (2, 2, width-2, height-2),
+            radius=10,
             fill=(35, 70, 150),
             outline="white",
             width=3
         )
 
         draw.rounded_rectangle(
-            (8, 8, width - 8, height - 8),
-            radius=6,
+            (10, 10, width-10, height-10),
+            radius=8,
             outline="white",
             width=2
         )
 
         draw.text(
-            (width // 2, height // 2),
+            (width//2, height//2),
             "★",
             font=center_font,
             fill="white",
@@ -996,28 +992,28 @@ def create_card_images():
             draw = ImageDraw.Draw(img)
 
             draw.rounded_rectangle(
-                (1, 1, width - 1, height - 1),
-                radius=8,
+                (1, 1, width-1, height-1),
+                radius=10,
                 outline="black",
                 width=2
             )
 
             draw.text(
-                (6, 4),
+                (7, 4),
                 rank,
                 font=rank_font,
                 fill=fill
             )
 
             draw.text(
-                (6, 21),
+                (7, 25),
                 symbol,
                 font=suit_font,
                 fill=fill
             )
 
             draw.text(
-                (width // 2, height // 2),
+                (width//2, height//2),
                 symbol,
                 font=center_font,
                 fill=fill,
@@ -1025,7 +1021,7 @@ def create_card_images():
             )
 
             draw.text(
-                (width - 6, height - 4),
+                (width-7, height-5),
                 rank,
                 font=rank_font,
                 fill=fill,
@@ -1034,13 +1030,7 @@ def create_card_images():
 
             img.save(path)
 
-
 create_card_images()
-
-
-# ============================================================
-# 카드 덱
-# ============================================================
 
 def create_deck():
     deck = []
@@ -1059,37 +1049,20 @@ def create_deck():
     random.shuffle(deck)
     return deck
 
-
 def card_value(card):
-    rank = card["rank"]
-
-    if rank == "A":
+    if card["rank"] == "A":
         return 1
 
-    if rank in ("10", "J", "Q", "K"):
+    if card["rank"] in ("10", "J", "Q", "K"):
         return 0
 
-    return int(rank)
-
+    return int(card["rank"])
 
 def baccarat_score(cards):
-    return (
-        sum(card_value(c) for c in cards)
-        % 10
-    )
+    return sum(card_value(c) for c in cards) % 10
 
-
-# ============================================================
-# 바카라 이미지
-# ============================================================
-
-def create_baccarat_image(
-    player,
-    banker,
-    result_text=None
-):
-    width = 500
-    height = 285
+def create_baccarat_image(player, banker, result_text=None):
+    width, height = 620, 330
 
     img = Image.new(
         "RGB",
@@ -1100,35 +1073,29 @@ def create_baccarat_image(
     draw = ImageDraw.Draw(img)
 
     draw.rounded_rectangle(
-        (5, 5, width - 5, height - 5),
+        (5, 5, width-5, height-5),
         radius=18,
         outline=(210, 170, 70),
         width=4
     )
 
-    title_font = get_font(22, True)
-    label_font = get_font(18, True)
-    score_font = get_font(19, True)
-    result_font = get_font(20, True)
+    title_font = get_font(24, True)
+    label_font = get_font(20, True)
+    score_font = get_font(20, True)
+    result_font = get_font(22, True)
 
     draw.text(
-        (width // 2, 25),
+        (width//2, 25),
         "B A C C A R A",
         font=title_font,
         fill=(245, 220, 140),
         anchor="ma"
     )
 
-    card_w = 80
-    card_h = 115
-    card_gap = 5
-
-    player_x = 70
-    banker_x = 320
-    card_y = 75
+    player_x, banker_x, card_y = 80, 390, 80
 
     draw.text(
-        (player_x + 40, 62),
+        (player_x+50, 65),
         "PLAYER",
         font=label_font,
         fill="white",
@@ -1136,7 +1103,7 @@ def create_baccarat_image(
     )
 
     draw.text(
-        (banker_x + 40, 62),
+        (banker_x+50, 65),
         "BANKER",
         font=label_font,
         fill="white",
@@ -1144,41 +1111,30 @@ def create_baccarat_image(
     )
 
     def paste_cards(cards, start_x):
-        for index, card in enumerate(cards):
+        for i, card in enumerate(cards):
             card_img = Image.open(
                 card["file"]
-            ).convert("RGB")
-
-            card_img = card_img.resize(
-                (card_w, card_h)
-            )
-
-            x = start_x + index * (
-                card_w + card_gap
-            )
+            ).convert("RGB").resize((100, 145))
 
             img.paste(
                 card_img,
-                (x, card_y)
+                (start_x + i*55, card_y)
             )
 
     paste_cards(player, player_x)
     paste_cards(banker, banker_x)
 
-    player_score = baccarat_score(player)
-    banker_score = baccarat_score(banker)
-
     draw.text(
-        (player_x + 40, 205),
-        f"PLAYER  {player_score}",
+        (player_x+50, 245),
+        f"PLAYER  {baccarat_score(player)}",
         font=score_font,
         fill="white",
         anchor="ma"
     )
 
     draw.text(
-        (banker_x + 40, 205),
-        f"BANKER  {banker_score}",
+        (banker_x+50, 245),
+        f"BANKER  {baccarat_score(banker)}",
         font=score_font,
         fill="white",
         anchor="ma"
@@ -1186,7 +1142,7 @@ def create_baccarat_image(
 
     if result_text:
         draw.text(
-            (width // 2, 255),
+            (width//2, 300),
             result_text,
             font=result_font,
             fill=(255, 225, 100),
@@ -1198,13 +1154,8 @@ def create_baccarat_image(
         "baccarat_result.png"
     )
 
-    img.save(
-        path,
-        quality=95
-    )
-
+    img.save(path, quality=95)
     return path
-
 
 async def send_baccarat_image(
     bot,
@@ -1226,46 +1177,52 @@ async def send_baccarat_image(
             caption=caption
         )
 
+# -------------------- 공통 베팅 파싱 --------------------
 
-# ============================================================
-# 바카라 베팅 파싱
-# ============================================================
+def parse_game_bet(args):
+    if len(args) == 2:
+        choice, amount_text = args
+        money_type = "P"
 
-def parse_bet(args):
-    if len(args) != 2:
-        return None
-
-    bet_type = args[0].strip().lower()
-
-    if bet_type in (
-        "p",
-        "플",
-        "플레이어",
-        "player"
+    elif (
+        len(args) == 3
+        and args[1].lower() in ("실", "실머니")
     ):
-        bet_type = "P"
-
-    elif bet_type in (
-        "b",
-        "뱅",
-        "뱅커",
-        "banker"
-    ):
-        bet_type = "B"
-
-    elif bet_type in (
-        "t",
-        "타이",
-        "tie"
-    ):
-        bet_type = "T"
+        choice, _, amount_text = args
+        money_type = "R"
 
     else:
         return None
 
+    aliases = {
+        "p": "P",
+        "플": "P",
+        "플레이어": "P",
+        "player": "P",
+
+        "b": "B",
+        "뱅": "B",
+        "뱅커": "B",
+        "banker": "B",
+
+        "t": "T",
+        "타이": "T",
+        "tie": "T",
+
+        "홀": "O",
+        "짝": "E",
+        "odd": "O",
+        "even": "E",
+    }
+
+    choice = aliases.get(choice.lower())
+
+    if choice is None:
+        return None
+
     try:
         amount = int(
-            args[1].replace(",", "")
+            amount_text.replace(",", "")
         )
     except ValueError:
         return None
@@ -1273,229 +1230,166 @@ def parse_bet(args):
     if amount <= 0:
         return None
 
-    return bet_type, amount
+    return choice, amount, money_type
 
-
-# ============================================================
-# 바카라 베팅
-# ============================================================
+# -------------------- 바카라 --------------------
 
 async def baccarat_bet(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    if not update.message:
+    if not update.message or not update.effective_user:
         return
 
-    if not update.effective_user:
-        return
+    parsed = parse_game_bet(context.args)
 
-    if not update.effective_chat:
-        return
-
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-
-    username = (
-        update.effective_user.first_name
-        or "유저"
-    )
-
-    parsed = parse_bet(context.args)
-
-    if not parsed:
+    if not parsed or parsed[0] not in ("P", "B", "T"):
         await update.message.reply_text(
-            "❌ 베팅 방법이 올바르지 않습니다.\n\n"
             "사용법:\n"
             "/배팅 플 5000\n"
             "/배팅 뱅 5000\n"
-            "/배팅 타이 5000"
+            "/배팅 타이 5000\n"
+            "/배팅 플 실 50000"
         )
         return
 
-    bet_type, amount = parsed
+    bet_type, amount, money_type = parsed
 
-    names = {
-        "P": "🔵 PLAYER",
-        "B": "🔴 BANKER",
-        "T": "🟢 TIE",
-    }
-
-    bet_name = names[bet_type]
+    uid = update.effective_user.id
+    username = update.effective_user.first_name or "유저"
 
     async with game_lock:
-
         if not baccarat_game["active"]:
             await update.message.reply_text(
-                "❌ 현재 베팅 시간이 아닙니다."
+                "❌ 현재 바카라 베팅 시간이 아닙니다."
             )
             return
 
-        if baccarat_game["chat_id"] != chat_id:
-            await update.message.reply_text(
-                "❌ 이 채팅방에서는 "
-                "현재 바카라가 진행 중이 아닙니다."
-            )
-            return
+        u = get_user(uid, username)
 
-        if user_id in baccarat_game["bets"]:
-            await update.message.reply_text(
-                "❌ 이번 바카라에는 "
-                "이미 베팅하셨습니다."
-            )
-            return
-
-        u = get_user(
-            user_id,
-            username
+        balance = (
+            u["real_money"]
+            if money_type == "R"
+            else u["points"]
         )
 
-        if u["points"] < amount:
+        unit = "원" if money_type == "R" else "P"
+
+        if balance < amount:
             await update.message.reply_text(
-                f"❌ 포인트가 부족합니다.\n"
-                f"💰 현재 보유머니: {u['points']:,}P\n"
-                f"💸 베팅금액: {amount:,}P"
+                f"❌ "
+                f"{'실머니' if money_type == 'R' else '포인트'}"
+                f"가 부족합니다.\n"
+                f"현재: {balance:,}{unit}"
             )
             return
 
-        new_points = u["points"] - amount
+        new_balance = balance - amount
 
-        update_user(
-            user_id,
-            points=new_points
-        )
+        if money_type == "R":
+            update_user(
+                uid,
+                real_money=new_balance
+            )
+        else:
+            update_user(
+                uid,
+                points=new_balance
+            )
 
-        baccarat_game["bets"][user_id] = {
+        baccarat_game["bets"].setdefault(
+            uid, []
+        ).append({
             "type": bet_type,
             "amount": amount,
+            "money": money_type,
             "name": username,
-        }
+        })
+
+    names = {
+        "P": "PLAYER",
+        "B": "BANKER",
+        "T": "TIE"
+    }
 
     await update.message.reply_text(
-        f"🎰 베팅이 완료되었습니다!\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"👤 {username}님\n"
-        f"🎯 {bet_name}\n"
-        f"💰 베팅금액: {amount:,}P\n"
-        f"💳 보유머니: {new_points:,}P"
+        f"✅ {names[bet_type]} 베팅 완료되었습니다!\n"
+        f"👤 {username}\n"
+        f"🎯 {names[bet_type]}\n"
+        f"💰 베팅금액: {amount:,}{unit}\n"
+        f"💳 베팅 후 보유머니: {new_balance:,}{unit}"
     )
-
-
-# ============================================================
-# 바카라 결과표
-# ============================================================
-
-def add_baccarat_history(
-    result,
-    player_score,
-    banker_score
-):
-    baccarat_history.append({
-        "result": result,
-        "player": player_score,
-        "banker": banker_score,
-    })
-
-    if len(baccarat_history) > MAX_HISTORY:
-        del baccarat_history[:-MAX_HISTORY]
-
-
-def make_result_history_text():
-    if not baccarat_history:
-        return "📊 바카라 결과표\n기록 없음"
-
-    lines = [
-        "📊 바카라 결과표",
-        "━━━━━━━━━━━━━━"
-    ]
-
-    for index, item in enumerate(
-        reversed(baccarat_history),
-        1
-    ):
-        result = item["result"]
-
-        if result == "P":
-            result_name = "🔵 PLAYER"
-        elif result == "B":
-            result_name = "🔴 BANKER"
-        else:
-            result_name = "🟢 TIE"
-
-        lines.append(
-            f"{index}. {result_name} "
-            f"({item['player']} : "
-            f"{item['banker']})"
-        )
-
-    return "\n".join(lines)
-
-
-# ============================================================
-# 바카라 게임
-# ============================================================
 
 async def play_baccarat(
     bot,
-    chat_id
+    chat_id,
+    bets
 ):
-    async with game_lock:
-        bets = dict(
-            baccarat_game["bets"]
-        )
-
-        baccarat_game["bets"] = {}
-        baccarat_game["chat_id"] = chat_id
-
     deck = create_deck()
-
-    player = []
-    banker = []
-
-    player.append(deck.pop())
-    player.append(deck.pop())
-
-    banker.append(deck.pop())
-    banker.append(deck.pop())
+    player, banker = [], []
 
     await bot.send_message(
         chat_id=chat_id,
         text="🎰 바카라 카드 공개를 시작합니다!"
     )
 
-    await send_baccarat_image(
-        bot,
-        chat_id,
-        player,
-        [],
-        "🔵 PLAYER 카드 공개"
-    )
-
-    await asyncio.sleep(3)
-
+    # 카드 한 장씩 1~2초 간격
+    player.append(deck.pop())
     await send_baccarat_image(
         bot,
         chat_id,
         player,
         banker,
-        "🔴 BANKER 카드 공개"
+        "🔵 PLAYER 첫 번째 카드"
+    )
+    await asyncio.sleep(
+        random.uniform(1.0, 2.0)
     )
 
-    player_score = baccarat_score(player)
-    banker_score = baccarat_score(banker)
-
-    natural = (
-        player_score in (8, 9)
-        or banker_score in (8, 9)
+    banker.append(deck.pop())
+    await send_baccarat_image(
+        bot,
+        chat_id,
+        player,
+        banker,
+        "🔴 BANKER 첫 번째 카드"
+    )
+    await asyncio.sleep(
+        random.uniform(1.0, 2.0)
     )
 
+    player.append(deck.pop())
+    await send_baccarat_image(
+        bot,
+        chat_id,
+        player,
+        banker,
+        "🔵 PLAYER 두 번째 카드"
+    )
+    await asyncio.sleep(
+        random.uniform(1.0, 2.0)
+    )
+
+    banker.append(deck.pop())
+    await send_baccarat_image(
+        bot,
+        chat_id,
+        player,
+        banker,
+        "🔴 BANKER 두 번째 카드"
+    )
+    await asyncio.sleep(
+        random.uniform(1.0, 2.0)
+    )
+
+    ps = baccarat_score(player)
+    bs = baccarat_score(banker)
+
+    natural = ps in (8, 9) or bs in (8, 9)
     player_third = None
 
     if not natural:
-
-        if player_score <= 5:
-            await asyncio.sleep(1)
-
+        if ps <= 5:
             player_third = deck.pop()
             player.append(player_third)
 
@@ -1507,77 +1401,57 @@ async def play_baccarat(
                 "🔵 PLAYER 추가 카드"
             )
 
-        banker_score = baccarat_score(banker)
-
-        if player_third is None:
-
-            if banker_score <= 5:
-                await asyncio.sleep(1)
-
-                banker.append(
-                    deck.pop()
-                )
-
-                await send_baccarat_image(
-                    bot,
-                    chat_id,
-                    player,
-                    banker,
-                    "🔴 BANKER 추가 카드"
-                )
-
-        else:
-
-            third_value = card_value(
-                player_third
+            await asyncio.sleep(
+                random.uniform(1.0, 2.0)
             )
 
-            banker_draw = False
+        bs = baccarat_score(banker)
+        banker_draw = False
 
-            if banker_score <= 2:
+        if player_third is None:
+            banker_draw = bs <= 5
+
+        else:
+            tv = card_value(player_third)
+
+            if bs <= 2:
                 banker_draw = True
 
-            elif banker_score == 3:
-                banker_draw = third_value != 8
+            elif bs == 3:
+                banker_draw = tv != 8
 
-            elif banker_score == 4:
-                banker_draw = third_value in (
-                    2, 3, 4, 5, 6, 7
-                )
+            elif bs == 4:
+                banker_draw = tv in (2, 3, 4, 5, 6, 7)
 
-            elif banker_score == 5:
-                banker_draw = third_value in (
-                    4, 5, 6, 7
-                )
+            elif bs == 5:
+                banker_draw = tv in (4, 5, 6, 7)
 
-            elif banker_score == 6:
-                banker_draw = third_value in (
-                    6, 7
-                )
+            elif bs == 6:
+                banker_draw = tv in (6, 7)
 
-            if banker_draw:
-                await asyncio.sleep(1)
+        if banker_draw:
+            banker.append(deck.pop())
 
-                banker.append(
-                    deck.pop()
-                )
+            await send_baccarat_image(
+                bot,
+                chat_id,
+                player,
+                banker,
+                "🔴 BANKER 추가 카드"
+            )
 
-                await send_baccarat_image(
-                    bot,
-                    chat_id,
-                    player,
-                    banker,
-                    "🔴 BANKER 추가 카드"
-                )
+            await asyncio.sleep(
+                random.uniform(1.0, 2.0)
+            )
 
-    player_score = baccarat_score(player)
-    banker_score = baccarat_score(banker)
+    ps = baccarat_score(player)
+    bs = baccarat_score(banker)
 
-    if player_score > banker_score:
+    if ps > bs:
         result = "P"
         result_text = "🔵 PLAYER 승리!"
 
-    elif banker_score > player_score:
+    elif bs > ps:
         result = "B"
         result_text = "🔴 BANKER 승리!"
 
@@ -1596,195 +1470,242 @@ async def play_baccarat(
     await bot.send_message(
         chat_id=chat_id,
         text=(
-            "🎰 바카라 최종 결과\n"
-            "━━━━━━━━━━━━━━\n"
-            f"🔵 PLAYER: {player_score}점\n"
-            f"🔴 BANKER: {banker_score}점\n\n"
+            f"🎰 바카라 최종 결과\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"🔵 PLAYER: {ps}점\n"
+            f"🔴 BANKER: {bs}점\n\n"
             f"🏆 {result_text}"
         )
     )
 
-    add_baccarat_history(
-        result,
-        player_score,
-        banker_score
-    )
+    baccarat_history.append({
+        "result": result,
+        "player": ps,
+        "banker": bs
+    })
 
-    hit_lines = []
-    miss_lines = []
-    settlement_lines = []
+    if len(baccarat_history) > MAX_HISTORY:
+        del baccarat_history[:-MAX_HISTORY]
 
-    for user_id, bet in bets.items():
+    hit = []
+    miss = []
+    settlement = []
 
-        bet_type = bet["type"]
-        amount = bet["amount"]
-        username = bet["name"]
+    for uid, user_bets in bets.items():
+        for bet in user_bets:
+            typ = bet["type"]
+            amount = bet["amount"]
+            money_type = bet["money"]
+            username = bet["name"]
 
-        names = {
-            "P": "🔵 PLAYER",
-            "B": "🔴 BANKER",
-            "T": "🟢 TIE",
-        }
+            u = get_user(uid, username)
 
-        bet_name = names[bet_type]
-
-        u = get_user(
-            user_id,
-            username
-        )
-
-        if bet_type == result:
-
-            if result == "T":
-                payout = amount * 9
-            else:
-                payout = amount * 2
-
-            new_points = (
-                u["points"] + payout
+            unit = (
+                "원"
+                if money_type == "R"
+                else "P"
             )
 
-            update_user(
-                user_id,
-                points=new_points
+            balance = (
+                u["real_money"]
+                if money_type == "R"
+                else u["points"]
             )
 
-            xp_result = add_xp_and_check_level(
-                user_id,
-                1
-            )
+            if typ == result:
+                # TIE 9배, PLAYER/BANKER 2배
+                payout = (
+                    amount * 9
+                    if result == "T"
+                    else amount * 2
+                )
 
-            hit_lines.append(
-                f"🎯 {username}님 "
-                f"{bet_name} 적중하셨습니다!\n"
-                f"💰 적중금액: +{payout:,}P\n"
-                f"💳 보유머니: {xp_result['points']:,}P\n"
-                f"✨ +1 XP"
-            )
+                new_balance = balance + payout
 
-            settlement_lines.append(
-                f"🎯 {username}: "
-                f"{bet_name} 적중 "
-                f"+{payout:,}P "
-                f"(보유 {xp_result['points']:,}P)"
-            )
-
-            if xp_result["level_ups"]:
-
-                for item in xp_result["level_ups"]:
-                    hit_lines.append(
-                        f"\n🎉 {username}님 레벨업!\n"
-                        f"🏅 Lv.{item['level']} "
-                        f"[{LEVEL_NAMES[item['level']]}]\n"
-                        f"🎁 +{item['reward']:,}P 지급"
+                if money_type == "R":
+                    update_user(
+                        uid,
+                        real_money=new_balance
+                    )
+                else:
+                    update_user(
+                        uid,
+                        points=new_balance
                     )
 
-        elif (
-            result == "T"
-            and bet_type in ("P", "B")
-        ):
+                hit.append(
+                    f"🎯 {username}님 적중하셨습니다!\n"
+                    f"💰 적중금액: +{payout:,}{unit}\n"
+                    f"💳 적중 후 보유머니: "
+                    f"{new_balance:,}{unit}"
+                )
 
-            payout = amount
+                settlement.append(
+                    f"🎯 {username}: "
+                    f"{payout:,}{unit} 적중"
+                )
 
-            new_points = (
-                u["points"] + payout
-            )
+            elif result == "T" and typ in ("P", "B"):
+                # TIE 시 PLAYER/BANKER 원금 반환
+                new_balance = balance + amount
 
-            update_user(
-                user_id,
-                points=new_points
-            )
+                if money_type == "R":
+                    update_user(
+                        uid,
+                        real_money=new_balance
+                    )
+                else:
+                    update_user(
+                        uid,
+                        points=new_balance
+                    )
 
-            settlement_lines.append(
-                f"↩️ {username}: "
-                f"{bet_name} 무승부 반환 "
-                f"+{payout:,}P "
-                f"(보유 {new_points:,}P)"
-            )
+                settlement.append(
+                    f"↩️ {username}: "
+                    f"{amount:,}{unit} 반환"
+                )
 
-        else:
+            else:
+                miss.append(
+                    f"❌ {username}님 "
+                    f"미적중하셨습니다.\n"
+                    f"💸 손실금액: "
+                    f"-{amount:,}{unit}"
+                )
 
-            current_points = u["points"]
+                # 기존 XP 시스템 유지
+                add_xp_and_check_level(uid, -1)
 
-            new_xp = max(
-                0,
-                u["xp"] - 1
-            )
+                settlement.append(
+                    f"❌ {username}: "
+                    f"-{amount:,}{unit}"
+                )
 
-            update_user(
-                user_id,
-                xp=new_xp
-            )
-
-            miss_lines.append(
-                f"❌ {username}님 "
-                f"{bet_name} 미적중하셨습니다.\n"
-                f"💸 손실금액: -{amount:,}P\n"
-                f"💳 보유머니: {current_points:,}P\n"
-                f"✨ -1 XP"
-            )
-
-            settlement_lines.append(
-                f"❌ {username}: "
-                f"{bet_name} 미적중 "
-                f"-{amount:,}P "
-                f"(보유 {current_points:,}P)"
-            )
-
-    if hit_lines:
+    if hit:
         await bot.send_message(
             chat_id=chat_id,
             text=(
                 "🎯 적중 결과\n"
                 "━━━━━━━━━━━━━━\n"
-                + "\n\n".join(hit_lines)
+                + "\n\n".join(hit)
             )
         )
 
-    if miss_lines:
+    if miss:
         await bot.send_message(
             chat_id=chat_id,
             text=(
                 "📌 베팅 결과\n"
                 "━━━━━━━━━━━━━━\n"
-                + "\n\n".join(miss_lines)
+                + "\n\n".join(miss)
             )
+        )
+
+    history_lines = [
+        "📊 바카라 결과표",
+        "━━━━━━━━━━━━━━"
+    ]
+
+    for i, item in enumerate(
+        reversed(baccarat_history),
+        1
+    ):
+        name = {
+            "P": "🔵 PLAYER",
+            "B": "🔴 BANKER",
+            "T": "🟢 TIE"
+        }[item["result"]]
+
+        history_lines.append(
+            f"{i}. {name} "
+            f"({item['player']} : {item['banker']})"
         )
 
     await bot.send_message(
         chat_id=chat_id,
-        text=make_result_history_text()
+        text="\n".join(history_lines)
     )
 
-    if settlement_lines:
+    if settlement:
         await bot.send_message(
             chat_id=chat_id,
             text=(
                 "💰 이번 바카라 정산\n"
                 "━━━━━━━━━━━━━━\n"
-                + "\n".join(settlement_lines)
+                + "\n".join(settlement)
             )
         )
 
+async def baccarat_timer(
+    application,
+    chat_id
+):
+    try:
+        # 중요:
+        # /바카라 핸들러가 sleep하지 않고 별도 task로 실행되므로
+        # 50초 동안 /배팅 명령을 정상적으로 처리할 수 있습니다.
+        await asyncio.sleep(40)
 
-# ============================================================
-# 바카라 시작
-# ============================================================
+        async with game_lock:
+            if not baccarat_game["active"]:
+                return
+
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⏰ 바카라 베팅 마감 10초 전!\n"
+                "⚠️ 10초 후 베팅이 마감됩니다."
+            )
+        )
+
+        await asyncio.sleep(10)
+
+        async with game_lock:
+            if not baccarat_game["active"]:
+                return
+
+            baccarat_game["active"] = False
+            bets = dict(baccarat_game["bets"])
+            baccarat_game["bets"] = {}
+            baccarat_game["chat_id"] = None
+
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "🔒 베팅 마감!\n"
+                "━━━━━━━━━━━━━━\n"
+                "🎰 베팅이 종료되었습니다.\n"
+                "⏳ 10초 후 카드를 공개합니다."
+            )
+        )
+
+        await asyncio.sleep(10)
+
+        await play_baccarat(
+            application.bot,
+            chat_id,
+            bets
+        )
+
+    except Exception as e:
+        print(
+            "바카라 타이머 오류:",
+            repr(e)
+        )
 
 async def start_baccarat(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update,
+    context
 ):
-    if not update.message:
-        return
-
-    if not update.effective_chat:
+    if (
+        not update.message
+        or not update.effective_chat
+    ):
         return
 
     chat_id = update.effective_chat.id
 
     async with game_lock:
-
         if baccarat_game["active"]:
             await update.message.reply_text(
                 "🎰 이미 진행 중인 바카라가 있습니다."
@@ -1802,162 +1723,600 @@ async def start_baccarat(
         "💰 베팅 방법\n"
         "/배팅 플 5000\n"
         "/배팅 뱅 5000\n"
-        "/배팅 타이 5000\n\n"
+        "/배팅 타이 5000\n"
+        "/배팅 플 실 50000\n\n"
         "🔵 플 = PLAYER\n"
         "🔴 뱅 = BANKER\n"
         "🟢 타이 = TIE"
     )
 
-    await asyncio.sleep(40)
-
-    async with game_lock:
-        if not baccarat_game["active"]:
-            return
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "⏰ 바카라 베팅 마감 10초 전!\n"
-            "⚠️ 10초 후 베팅이 마감됩니다."
+    # 절대 await로 긴 타이머를 여기서 돌리지 않음
+    context.application.create_task(
+        baccarat_timer(
+            context.application,
+            chat_id
         )
     )
 
-    await asyncio.sleep(10)
+# -------------------- 홀짝 --------------------
 
-    async with game_lock:
+def odd_even_value(card):
+    rank = card["rank"]
 
-        if not baccarat_game["active"]:
-            return
+    if rank == "A":
+        return 1
 
-        baccarat_game["active"] = False
+    if rank == "J":
+        return 11
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "🔒 베팅 마감!\n"
-            "━━━━━━━━━━━━━━\n"
-            "🎰 베팅이 종료되었습니다.\n"
-            "⏳ 10초 후 카드를 공개합니다."
-        )
-    )
+    if rank == "Q":
+        return 12
 
-    await asyncio.sleep(10)
+    if rank == "K":
+        return 13
 
-    await play_baccarat(
-        context.bot,
-        chat_id
-    )
+    return int(rank)
 
-
-# ============================================================
-# 도움말
-# ============================================================
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+def create_odd_even_gif(
+    card1,
+    card2,
+    result
 ):
+    width, height = 500, 260
+    frames = []
+
+    bg = (20, 70, 45)
+
+    title_font = get_font(23, True)
+    label_font = get_font(18, True)
+    result_font = get_font(22, True)
+
+    front = Image.open(
+        card1["file"]
+    ).convert("RGB").resize((110, 160))
+
+    back = Image.open(
+        os.path.join(
+            CARD_DIR,
+            "BACK.png"
+        )
+    ).convert("RGB").resize((110, 160))
+
+    second = Image.open(
+        card2["file"]
+    ).convert("RGB").resize((110, 160))
+
+    # 0~10초: 카드가 가만히 있음
+    # 250ms x 40 = 10초
+    for _ in range(40):
+        img = Image.new(
+            "RGB",
+            (width, height),
+            bg
+        )
+
+        draw = ImageDraw.Draw(img)
+
+        draw.text(
+            (width//2, 25),
+            "O D D  &  E V E N",
+            font=title_font,
+            fill=(245, 220, 140),
+            anchor="ma"
+        )
+
+        img.paste(front, (110, 70))
+        img.paste(back, (280, 70))
+
+        draw.text(
+            (165, 245),
+            "첫 번째",
+            font=label_font,
+            fill="white",
+            anchor="ma"
+        )
+
+        draw.text(
+            (335, 245),
+            "두 번째",
+            font=label_font,
+            fill="white",
+            anchor="ma"
+        )
+
+        frames.append(img)
+
+    # 10~15초:
+    # 뒷면 카드가 서서히 얇아지며 뒤집히는 느낌
+    # 250ms x 20 = 5초
+    for i in range(20):
+        scale = max(
+            0.06,
+            1.0 - i / 20.0
+        )
+
+        w = max(
+            6,
+            int(110 * scale)
+        )
+
+        resized = second.resize(
+            (w, 160)
+        )
+
+        img = Image.new(
+            "RGB",
+            (width, height),
+            bg
+        )
+
+        draw = ImageDraw.Draw(img)
+
+        draw.text(
+            (width//2, 25),
+            "O D D  &  E V E N",
+            font=title_font,
+            fill=(245, 220, 140),
+            anchor="ma"
+        )
+
+        img.paste(front, (110, 70))
+
+        img.paste(
+            resized,
+            (335 - w//2, 70)
+        )
+
+        frames.append(img)
+
+    # 최종 앞면
+    for _ in range(4):
+        img = Image.new(
+            "RGB",
+            (width, height),
+            bg
+        )
+
+        draw = ImageDraw.Draw(img)
+
+        draw.text(
+            (width//2, 25),
+            "O D D  &  E V E N",
+            font=title_font,
+            fill=(245, 220, 140),
+            anchor="ma"
+        )
+
+        img.paste(front, (110, 70))
+        img.paste(second, (280, 70))
+
+        draw.text(
+            (width//2, 245),
+            result,
+            font=result_font,
+            fill=(255, 225, 100),
+            anchor="ma"
+        )
+
+        frames.append(img)
+
+    path = os.path.join(
+        CARD_DIR,
+        "odd_even.gif"
+    )
+
+    frames[0].save(
+        path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=250,
+        loop=0
+    )
+
+    return path
+
+async def odd_even_timer(
+    application,
+    chat_id
+):
+    try:
+        await asyncio.sleep(40)
+
+        async with odd_even_lock:
+            if not odd_even_game["active"]:
+                return
+
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⏰ 홀짝 베팅 마감 10초 전!\n"
+                "⚠️ 10초 후 베팅이 마감됩니다."
+            )
+        )
+
+        await asyncio.sleep(10)
+
+        async with odd_even_lock:
+            if not odd_even_game["active"]:
+                return
+
+            odd_even_game["active"] = False
+            bets = dict(odd_even_game["bets"])
+            odd_even_game["bets"] = {}
+            odd_even_game["chat_id"] = None
+
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "🔒 홀짝 베팅 마감!\n"
+                "━━━━━━━━━━━━━━\n"
+                "🎴 카드 공개 준비 중...\n"
+                "⏳ 약 15초 후 결과가 공개됩니다."
+            )
+        )
+
+        deck = create_deck()
+
+        card1 = deck.pop()
+        card2 = deck.pop()
+
+        total = (
+            odd_even_value(card1)
+            + odd_even_value(card2)
+        )
+
+        result = (
+            "O"
+            if total % 2
+            else "E"
+        )
+
+        result_name = (
+            "🟢 홀"
+            if result == "O"
+            else "🔵 짝"
+        )
+
+        path = create_odd_even_gif(
+            card1,
+            card2,
+            result_name
+        )
+
+        with open(path, "rb") as f:
+            await application.bot.send_animation(
+                chat_id=chat_id,
+                animation=InputFile(f),
+                caption=(
+                    f"🎴 홀짝 결과\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"첫 번째 카드: {card1['rank']}\n"
+                    f"두 번째 카드: {card2['rank']}\n"
+                    f"합계: {total}\n\n"
+                    f"🏆 결과: {result_name}"
+                )
+            )
+
+        hit = []
+        miss = []
+
+        for uid, user_bets in bets.items():
+            for bet in user_bets:
+                typ = bet["type"]
+                amount = bet["amount"]
+                money_type = bet["money"]
+                username = bet["name"]
+
+                u = get_user(uid, username)
+
+                unit = (
+                    "원"
+                    if money_type == "R"
+                    else "P"
+                )
+
+                balance = (
+                    u["real_money"]
+                    if money_type == "R"
+                    else u["points"]
+                )
+
+                if typ == result:
+                    payout = amount * 2
+                    new_balance = balance + payout
+
+                    if money_type == "R":
+                        update_user(
+                            uid,
+                            real_money=new_balance
+                        )
+                    else:
+                        update_user(
+                            uid,
+                            points=new_balance
+                        )
+
+                    hit.append(
+                        f"🎯 {username}님 "
+                        f"적중하셨습니다!\n"
+                        f"💰 적중금액: "
+                        f"+{payout:,}{unit}\n"
+                        f"💳 적중 후 보유머니: "
+                        f"{new_balance:,}{unit}"
+                    )
+
+                else:
+                    miss.append(
+                        f"❌ {username}님 "
+                        f"미적중하셨습니다.\n"
+                        f"💸 손실금액: "
+                        f"-{amount:,}{unit}"
+                    )
+
+                    add_xp_and_check_level(
+                        uid,
+                        -1
+                    )
+
+        if hit:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "🎯 적중 결과\n"
+                    "━━━━━━━━━━━━━━\n"
+                    + "\n\n".join(hit)
+                )
+            )
+
+        if miss:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "📌 베팅 결과\n"
+                    "━━━━━━━━━━━━━━\n"
+                    + "\n\n".join(miss)
+                )
+            )
+
+    except Exception as e:
+        print(
+            "홀짝 타이머 오류:",
+            repr(e)
+        )
+
+async def odd_even_bet(
+    update,
+    context
+):
+    if not update.message or not update.effective_user:
+        return
+
+    parsed = parse_game_bet(
+        context.args
+    )
+
+    if not parsed or parsed[0] not in ("O", "E"):
+        await update.message.reply_text(
+            "사용법:\n"
+            "/홀짝 홀 10000\n"
+            "/홀짝 짝 10000\n"
+            "/홀짝 홀 실 50000"
+        )
+        return
+
+    bet_type, amount, money_type = parsed
+
+    uid = update.effective_user.id
+    username = update.effective_user.first_name or "유저"
+
+    async with odd_even_lock:
+        if not odd_even_game["active"]:
+            await update.message.reply_text(
+                "❌ 현재 홀짝 베팅 시간이 아닙니다."
+            )
+            return
+
+        u = get_user(uid, username)
+
+        balance = (
+            u["real_money"]
+            if money_type == "R"
+            else u["points"]
+        )
+
+        unit = (
+            "원"
+            if money_type == "R"
+            else "P"
+        )
+
+        if balance < amount:
+            await update.message.reply_text(
+                f"❌ "
+                f"{'실머니' if money_type == 'R' else '포인트'}"
+                f"가 부족합니다.\n"
+                f"현재: {balance:,}{unit}"
+            )
+            return
+
+        new_balance = balance - amount
+
+        if money_type == "R":
+            update_user(
+                uid,
+                real_money=new_balance
+            )
+        else:
+            update_user(
+                uid,
+                points=new_balance
+            )
+
+        odd_even_game["bets"].setdefault(
+            uid, []
+        ).append({
+            "type": bet_type,
+            "amount": amount,
+            "money": money_type,
+            "name": username
+        })
+
+    name = (
+        "홀"
+        if bet_type == "O"
+        else "짝"
+    )
+
+    await update.message.reply_text(
+        f"✅ {name} 베팅 완료되었습니다!\n"
+        f"👤 {username}\n"
+        f"🎯 {name}\n"
+        f"💰 베팅금액: {amount:,}{unit}\n"
+        f"💳 베팅 후 보유머니: {new_balance:,}{unit}"
+    )
+
+async def start_odd_even(
+    update,
+    context
+):
+    if (
+        not update.message
+        or not update.effective_chat
+    ):
+        return
+
+    chat_id = update.effective_chat.id
+
+    async with odd_even_lock:
+        if odd_even_game["active"]:
+            await update.message.reply_text(
+                "🎴 이미 진행 중인 홀짝 게임이 있습니다."
+            )
+            return
+
+        odd_even_game["active"] = True
+        odd_even_game["bets"] = {}
+        odd_even_game["chat_id"] = chat_id
+
+    await update.message.reply_text(
+        "🎴 홀짝 베팅 시작!\n"
+        "━━━━━━━━━━━━━━\n"
+        "⏱️ 지금부터 50초 동안 "
+        "자유롭게 베팅할 수 있습니다.\n\n"
+        "💰 베팅 방법\n"
+        "/홀짝 홀 10000\n"
+        "/홀짝 짝 10000\n"
+        "/홀짝 홀 실 50000\n\n"
+        "🟢 홀 = ODD\n"
+        "🔵 짝 = EVEN"
+    )
+
+    context.application.create_task(
+        odd_even_timer(
+            context.application,
+            chat_id
+        )
+    )
+
+# -------------------- 도움말 / 한국어 명령어 --------------------
+
+async def help_command(update, context):
     if not update.message:
         return
 
     await update.message.reply_text(
         "📖 명령어\n"
         "━━━━━━━━━━━━━━\n"
-        "/내정보 - 내 정보\n"
-        "/출석 - 출석체크\n"
-        "/레벨업 - 레벨업 상태 확인\n"
-        "/복권 - 복권\n"
-        "/바카라 - 바카라 시작\n\n"
-        "🎰 바카라 베팅\n"
+        "/내정보\n"
+        "/출석\n"
+        "/레벨업\n"
+        "/채팅순위\n"
+        "/복권\n"
+        "/복권 실\n\n"
+        "/바카라\n"
         "/배팅 플 1000\n"
         "/배팅 뱅 1000\n"
-        "/배팅 타이 1000\n\n"
-        "🔤 영어도 가능\n"
-        "/배팅 P 1000\n"
-        "/배팅 B 1000\n"
-        "/배팅 T 1000\n\n"
-        "💬 일반 채팅으로 XP 획득\n\n"
-        "👑 관리자 명령어\n"
+        "/배팅 타이 1000\n"
+        "/배팅 플 실 50000\n\n"
+        "/홀짝\n"
+        "/홀짝 홀 1000\n"
+        "/홀짝 짝 1000\n"
+        "/홀짝 홀 실 50000\n\n"
+        "👑 관리자\n"
         "/지급 금액\n"
         "/지급 유저ID 금액\n"
         "/차감 금액\n"
         "/차감 유저ID 금액\n"
+        "/실머니지급 금액\n"
+        "/실머니지급 유저ID 금액\n"
+        "/실머니차감 금액\n"
+        "/실머니차감 유저ID 금액\n"
         "/경험치 금액\n"
         "/경험치 유저ID 금액\n"
         "/경험치차감 금액\n"
         "/경험치차감 유저ID 금액"
     )
 
-
-# ============================================================
-# 한국어 명령어
-# ============================================================
-
 async def korean_commands(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    update,
+    context
 ):
-    if not update.message:
+    if (
+        not update.message
+        or not update.message.text
+    ):
         return
 
-    if not update.message.text:
-        return
-
-    parts = update.message.text.strip().split()
+    parts = (
+        update.message.text
+        .strip()
+        .split()
+    )
 
     if not parts:
         return
 
-    text = parts[0]
+    # 텔레그램 명령어에 @봇아이디가 붙는 경우도 처리
+    command = parts[0].split("@")[0]
 
     handlers = {
         "/내정보": my_info,
         "/출석": attendance,
         "/레벨업": level_up,
+        "/채팅순위": chat_ranking,
         "/복권": buy_lottery,
         "/바카라": start_baccarat,
+        "/홀짝": start_odd_even,
         "/도움말": help_command,
+
         "/지급": admin_give,
         "/차감": admin_take,
+        "/실머니지급": admin_real_give,
+        "/실머니차감": admin_real_take,
         "/경험치": admin_xp_give,
         "/경험치차감": admin_xp_take,
+
         "/배팅": baccarat_bet,
         "/베팅": baccarat_bet,
     }
 
-    handler = handlers.get(text)
+    handler = handlers.get(command)
 
     if handler is None:
         return
 
     context.args = parts[1:]
+    await handler(update, context)
 
-    await handler(
-        update,
-        context
-    )
-
-
-# ============================================================
-# 에러 처리
-# ============================================================
-
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def error_handler(update, context):
     print(
         "BOT ERROR:",
         repr(context.error)
     )
 
-
-# ============================================================
-# 실행
-# ============================================================
+# -------------------- 실행 --------------------
 
 def main():
-
     print("================================")
     print("Telegram Bot Starting...")
     print("================================")
@@ -1982,16 +2341,22 @@ def main():
         )
     )
 
+    command_pattern = (
+        r"^/(내정보|출석|레벨업|채팅순위|복권|바카라|홀짝|도움말|"
+        r"지급|차감|실머니지급|실머니차감|경험치|경험치차감|배팅|베팅)"
+        r"(?:@[\w_]+)?"
+        r"(?:\s+.*)?$"
+    )
+
     application.add_handler(
         MessageHandler(
-            filters.Regex(
-                r"^/(내정보|출석|레벨업|복권|바카라|도움말|지급|차감|경험치|경험치차감|배팅|베팅)(?:\s+.*)?$"
-            ),
+            filters.Regex(command_pattern),
             korean_commands
         ),
         group=0
     )
 
+    # 명령어가 아닌 일반 텍스트만 XP + 채팅 집계
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -2009,7 +2374,6 @@ def main():
     application.run_polling(
         allowed_updates=Update.ALL_TYPES
     )
-
 
 if __name__ == "__main__":
     main()
