@@ -2,6 +2,10 @@ import os
 import random
 import asyncio
 import sqlite3
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if DATABASE_URL:
+    import psycopg2
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from threading import Thread
@@ -18,8 +22,15 @@ from telegram.ext import (
 )
 
 TOKEN = os.environ.get("BOT_TOKEN")
-DB_FILE = "bot_data.db"
-CARD_DIR = "cards"
+# 영속 저장 우선순위: DATABASE_URL(PostgreSQL) -> /data SQLite -> 로컬 SQLite
+# Render Free에서는 로컬 파일이 재배포/재시작 때 사라질 수 있으므로 DATABASE_URL 사용을 권장합니다.
+if os.environ.get("DB_FILE"):
+    DB_FILE = os.environ["DB_FILE"]
+elif os.path.isdir("/data"):
+    DB_FILE = "/data/bot_data.db"
+else:
+    DB_FILE = "bot_data.db"
+CARD_DIR = os.environ.get("CARD_DIR", "cards")
 KR_TZ = ZoneInfo("Asia/Seoul")
 
 if not TOKEN:
@@ -39,9 +50,6 @@ baccarat_game = {"active": False, "bets": {}, "chat_id": None}
 odd_even_game = {"active": False, "bets": {}, "chat_id": None}
 baccarat_history = []
 MAX_HISTORY = 20
-BETTING_SECONDS = 60
-CARD_VIDEO_SECONDS = 12
-RESULT_DELAY_SECONDS = 2.5
 
 game_lock = asyncio.Lock()
 odd_even_lock = asyncio.Lock()
@@ -66,7 +74,44 @@ def run_web_server():
     server.serve_forever()
 
 
+class PGCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def execute(self, sql, params=None):
+        sql = sql.replace("?", "%s")
+        if params is None:
+            return self._cursor.execute(sql)
+        return self._cursor.execute(sql, params)
+
+    def executemany(self, sql, seq):
+        return self._cursor.executemany(sql.replace("?", "%s"), seq)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class PGConnection:
+    def __init__(self, connection):
+        self._connection = connection
+
+    def cursor(self):
+        return PGCursor(self._connection.cursor())
+
+    def commit(self):
+        return self._connection.commit()
+
+    def rollback(self):
+        return self._connection.rollback()
+
+    def close(self):
+        return self._connection.close()
+
+
 def db_connect():
+    if DATABASE_URL:
+        return PGConnection(psycopg2.connect(DATABASE_URL, connect_timeout=20))
+
     conn = sqlite3.connect(DB_FILE, timeout=20, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=20000")
@@ -89,7 +134,12 @@ def init_db():
         )
     """)
 
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+    if DATABASE_URL:
+        cols = [r[0] for r in conn.cursor().execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name='users'"
+        ).fetchall()]
+    else:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
 
     if "real_money" not in cols:
         conn.execute("ALTER TABLE users ADD COLUMN real_money INTEGER DEFAULT 0")
@@ -549,53 +599,83 @@ async def buy_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     uid = update.effective_user.id
     username = update.effective_user.first_name or "유저"
+    args = list(context.args)
 
-    use_real = bool(
-        context.args
-        and context.args[0] in ("실", "실머니")
-    )
+    # /복권 1장 ~ /복권 10장
+    # /복권 실 1장 ~ /복권 실 10장 도 지원
+    use_real = False
+    if args and args[0].lower() in ("실", "실머니"):
+        use_real = True
+        args.pop(0)
+    elif args and args[-1].lower() in ("실", "실머니"):
+        use_real = True
+        args.pop()
+
+    count = 1
+    if args:
+        raw = args[0].replace(",", "")
+        if raw.endswith("장"):
+            raw = raw[:-1]
+        try:
+            count = int(raw)
+        except ValueError:
+            await update.message.reply_text(
+                "사용법: /복권 1장 ~ /복권 10장\n"
+                "실머니: /복권 실 1장 ~ /복권 실 10장"
+            )
+            return
+
+    if not 1 <= count <= 10:
+        await update.message.reply_text("❌ 복권은 한 번에 1장부터 10장까지만 구매할 수 있습니다.")
+        return
 
     cost = 100 if use_real else 1000
-
+    unit = "원" if use_real else "P"
     u = get_user(uid, username)
     balance = u["real_money"] if use_real else u["points"]
+    total_cost = cost * count
 
-    if balance < cost:
+    if balance < total_cost:
         await update.message.reply_text(
             f"❌ {'실머니' if use_real else '포인트'}가 부족합니다.\n"
-            f"현재: {balance:,}{'원' if use_real else 'P'}"
+            f"필요: {total_cost:,}{unit}\n"
+            f"현재: {balance:,}{unit}"
         )
         return
 
-    rand = random.random() * 100
+    results = []
+    total_prize = 0
+    current_balance = balance
 
-    if rand < 0.05:
-        rank, prize = "1등 🥇", 50000
-    elif rand < 0.15:
-        rank, prize = "2등 🥈", 30000
-    elif rand < 0.95:
-        rank, prize = "3등 🥉", 10000
-    elif rand < 2.15:
-        rank, prize = "4등 🏅", 7000
-    else:
-        rank, prize = "5등 🎗️", lottery_5th_prize()
+    for i in range(1, count + 1):
+        rand = random.random() * 100
+        if rand < 0.05:
+            rank, prize = "1등 🥇", 50000
+        elif rand < 0.15:
+            rank, prize = "2등 🥈", 30000
+        elif rand < 0.95:
+            rank, prize = "3등 🥉", 10000
+        elif rand < 2.15:
+            rank, prize = "4등 🏅", 7000
+        else:
+            rank, prize = "5등 🎗️", lottery_5th_prize()
 
-    new_balance = balance - cost + prize
+        total_prize += prize
+        current_balance += prize - cost
+        results.append(f"{i}. {rank} / +{prize:,}{unit}")
 
     if use_real:
-        update_user(uid, real_money=new_balance)
-        unit = "원"
+        update_user(uid, real_money=current_balance)
     else:
-        update_user(uid, points=new_balance)
-        unit = "P"
+        update_user(uid, points=current_balance)
 
     await update.message.reply_text(
         f"🎫 복권 결과\n"
         f"━━━━━━━━━━━━━━\n"
-        f"🏆 등수: {rank}\n"
-        f"💰 당첨: {prize:,}{unit}\n"
-        f"💳 구매: -{cost:,}{unit}\n"
-        f"💵 현재 보유: {new_balance:,}{unit}"
+        f"🎟️ 구매: {count}장 (-{total_cost:,}{unit})\n\n"
+        + "\n".join(results)
+        + f"\n\n💰 총 당첨: +{total_prize:,}{unit}\n"
+        f"💵 현재 보유: {current_balance:,}{unit}"
     )
 
 
@@ -980,96 +1060,121 @@ def baccarat_score(cards):
 
 
 def create_baccarat_image(player, banker, result_text=None):
-    width, height = 620, 330
-
+    # 기존 바카라 이미지보다 약 1/4 작게 표시
+    width, height = 480, 255
     img = Image.new("RGB", (width, height), (20, 70, 45))
     draw = ImageDraw.Draw(img)
 
-    draw.rounded_rectangle(
-        (5, 5, width - 5, height - 5),
-        radius=18,
-        outline=(210, 170, 70),
-        width=4
-    )
+    draw.rounded_rectangle((4, 4, width - 4, height - 4), radius=14,
+                           outline=(210, 170, 70), width=3)
 
-    title_font = get_font(24, True)
-    label_font = get_font(20, True)
-    score_font = get_font(20, True)
-    result_font = get_font(22, True)
+    title_font = get_font(19, True)
+    label_font = get_font(15, True)
+    score_font = get_font(15, True)
+    result_font = get_font(17, True)
 
-    draw.text(
-        (width // 2, 25),
-        "B A C C A R A",
-        font=title_font,
-        fill=(245, 220, 140),
-        anchor="ma"
-    )
+    draw.text((width // 2, 21), "B A C C A R A", font=title_font,
+              fill=(245, 220, 140), anchor="ma")
 
-    player_x, banker_x, card_y = 80, 390, 80
+    card_w, card_h = 76, 110
+    player_x, banker_x, card_y = 48, 300, 58
 
-    draw.text(
-        (player_x + 50, 65),
-        "PLAYER",
-        font=label_font,
-        fill="white",
-        anchor="ms"
-    )
+    draw.text((player_x + card_w, 45), "PLAYER", font=label_font,
+              fill="white", anchor="ms")
+    draw.text((banker_x + card_w, 45), "BANKER", font=label_font,
+              fill="white", anchor="ms")
 
-    draw.text(
-        (banker_x + 50, 65),
-        "BANKER",
-        font=label_font,
-        fill="white",
-        anchor="ms"
-    )
+    back_path = os.path.join(CARD_DIR, "BACK.png")
+    back_img = Image.open(back_path).convert("RGB").resize((card_w, card_h))
 
     def paste_cards(cards, start_x):
         for i, card in enumerate(cards):
-            card_img = Image.open(card["file"]).convert("RGB").resize((100, 145))
-            img.paste(card_img, (start_x + i * 55, card_y))
+            card_img = Image.open(card["file"]).convert("RGB").resize((card_w, card_h))
+            img.paste(card_img, (start_x + i * 45, card_y))
 
     paste_cards(player, player_x)
     paste_cards(banker, banker_x)
 
-    draw.text(
-        (player_x + 50, 245),
-        f"PLAYER  {baccarat_score(player)}",
-        font=score_font,
-        fill="white",
-        anchor="ma"
-    )
-
-    draw.text(
-        (banker_x + 50, 245),
-        f"BANKER  {baccarat_score(banker)}",
-        font=score_font,
-        fill="white",
-        anchor="ma"
-    )
+    draw.text((player_x + card_w, 190), f"PLAYER  {baccarat_score(player)}",
+              font=score_font, fill="white", anchor="ma")
+    draw.text((banker_x + card_w, 190), f"BANKER  {baccarat_score(banker)}",
+              font=score_font, fill="white", anchor="ma")
 
     if result_text:
-        draw.text(
-            (width // 2, 300),
-            result_text,
-            font=result_font,
-            fill=(255, 225, 100),
-            anchor="mm"
-        )
+        draw.text((width // 2, 225), result_text, font=result_font,
+                  fill=(255, 225, 100), anchor="mm")
 
     path = os.path.join(CARD_DIR, "baccarat_result.png")
     img.save(path, quality=95)
     return path
 
 
+def create_baccarat_gif(player, banker):
+    """바카라 기본 4장 공개 연출. 총 10초.
+    P1 -> B1 -> P2 -> B2 순서로 한 장씩 앞면 공개한다.
+    결과 문구는 GIF에 넣지 않고 GIF 종료 후 별도 메시지로 보낸다.
+    """
+    width, height = 480, 255
+    bg = (20, 70, 45)
+    frames = []
+    title_font = get_font(19, True)
+    label_font = get_font(15, True)
+    score_font = get_font(15, True)
+
+    card_w, card_h = 76, 110
+    player_x, banker_x, card_y = 48, 300, 58
+    back = Image.open(os.path.join(CARD_DIR, "BACK.png")).convert("RGB").resize((card_w, card_h))
+
+    def make_frame(p_visible, b_visible):
+        img = Image.new("RGB", (width, height), bg)
+        draw = ImageDraw.Draw(img)
+        draw.rounded_rectangle((4, 4, width - 4, height - 4), radius=14,
+                               outline=(210, 170, 70), width=3)
+        draw.text((width // 2, 21), "B A C C A R A", font=title_font,
+                  fill=(245, 220, 140), anchor="ma")
+        draw.text((player_x + card_w, 45), "PLAYER", font=label_font,
+                  fill="white", anchor="ms")
+        draw.text((banker_x + card_w, 45), "BANKER", font=label_font,
+                  fill="white", anchor="ms")
+
+        for i in range(2):
+            p = Image.open(player[i]["file"]).convert("RGB").resize((card_w, card_h)) if i < p_visible else back
+            b = Image.open(banker[i]["file"]).convert("RGB").resize((card_w, card_h)) if i < b_visible else back
+            img.paste(p, (player_x + i * 45, card_y))
+            img.paste(b, (banker_x + i * 45, card_y))
+
+        # 공개된 카드까지만 점수 표시
+        p_cards = player[:p_visible]
+        b_cards = banker[:b_visible]
+        draw.text((player_x + card_w, 190), f"PLAYER  {baccarat_score(p_cards)}",
+                  font=score_font, fill="white", anchor="ma")
+        draw.text((banker_x + card_w, 190), f"BANKER  {baccarat_score(b_cards)}",
+                  font=score_font, fill="white", anchor="ma")
+        return img
+
+    # 10초 = 40프레임 × 250ms
+    # 1.5초 P1 / 1.5초 B1 / 1.5초 P2 / 1.5초 B2 / 4초 최종 공개 상태
+    for _ in range(6):
+        frames.append(make_frame(1, 0))
+    for _ in range(6):
+        frames.append(make_frame(1, 1))
+    for _ in range(6):
+        frames.append(make_frame(2, 1))
+    for _ in range(6):
+        frames.append(make_frame(2, 2))
+    for _ in range(16):
+        frames.append(make_frame(2, 2))
+
+    path = os.path.join(CARD_DIR, "baccarat_reveal.gif")
+    frames[0].save(path, save_all=True, append_images=frames[1:],
+                   duration=250, loop=0)
+    return path
+
+
 async def send_baccarat_image(bot, chat_id, player, banker, caption=None):
     path = create_baccarat_image(player, banker, caption)
-
     with open(path, "rb") as f:
-        await bot.send_photo(
-            chat_id=chat_id,
-            photo=InputFile(f),
-            caption=caption
-        )
+        await bot.send_photo(chat_id=chat_id, photo=InputFile(f), caption=caption)
 
 
 def parse_game_bet(args):
@@ -1123,7 +1228,6 @@ async def baccarat_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     parsed = parse_game_bet(context.args)
-
     if not parsed or parsed[0] not in ("P", "B", "T"):
         await update.message.reply_text(
             "사용법:\n"
@@ -1138,18 +1242,17 @@ async def baccarat_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     username = update.effective_user.first_name or "유저"
     chat_id = update.effective_chat.id
-
     start_timer = False
 
     async with game_lock:
-        # 첫 /배팅이 들어온 순간부터 60초 바카라 라운드를 시작한다.
+        # 첫 배팅이 들어오는 순간 게임을 시작한다.
         if not baccarat_game["active"]:
             baccarat_game["active"] = True
             baccarat_game["bets"] = {}
             baccarat_game["chat_id"] = chat_id
             start_timer = True
         elif baccarat_game["chat_id"] != chat_id:
-            await update.message.reply_text("❌ 다른 채팅에서 이미 바카라 게임이 진행 중입니다.")
+            await update.message.reply_text("❌ 다른 채팅방에서 이미 바카라가 진행 중입니다.")
             return
 
         u = get_user(uid, username)
@@ -1157,7 +1260,7 @@ async def baccarat_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         unit = "원" if money_type == "R" else "P"
 
         if balance < amount:
-            # 첫 베팅으로 라운드를 만들었지만 돈이 부족하면 즉시 라운드를 취소한다.
+            # 첫 배팅으로 게임을 열었는데 잔액이 부족하면 게임도 취소한다.
             if start_timer:
                 baccarat_game["active"] = False
                 baccarat_game["bets"] = {}
@@ -1169,7 +1272,6 @@ async def baccarat_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         new_balance = balance - amount
-
         if money_type == "R":
             update_user(uid, real_money=new_balance)
         else:
@@ -1186,8 +1288,7 @@ async def baccarat_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🎰 바카라 베팅 시작!\n"
             "━━━━━━━━━━━━━━\n"
-            "⏱️ 첫 베팅부터 60초 동안 자유롭게 베팅할 수 있습니다.\n"
-            "⚠️ 마지막 10초에는 추가 베팅이 가능합니다.\n\n"
+            "⏱️ 첫 베팅부터 50초 동안 자유롭게 베팅할 수 있습니다.\n\n"
             "💰 베팅 방법\n"
             "/배팅 플 5000\n"
             "/배팅 뱅 5000\n"
@@ -1197,12 +1298,9 @@ async def baccarat_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔴 뱅 = BANKER\n"
             "🟢 타이 = TIE"
         )
-        context.application.create_task(
-            baccarat_timer(context.application, chat_id)
-        )
+        context.application.create_task(baccarat_timer(context.application, chat_id))
 
     names = {"P": "PLAYER", "B": "BANKER", "T": "TIE"}
-
     await update.message.reply_text(
         f"✅ {names[bet_type]} 베팅 완료되었습니다!\n"
         f"👤 {username}\n"
@@ -1211,59 +1309,30 @@ async def baccarat_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💳 베팅 후 보유머니: {new_balance:,}{unit}"
     )
 
+
 async def play_baccarat(bot, chat_id, bets):
     deck = create_deck()
-    player, banker = [], []
-
-    await bot.send_message(
-        chat_id=chat_id,
-        text="🎰 바카라 카드 공개를 시작합니다!"
-    )
-
-    player.append(deck.pop())
-    await send_baccarat_image(bot, chat_id, player, banker, "🔵 PLAYER 첫 번째 카드")
-    await asyncio.sleep(0.8)
-
-    banker.append(deck.pop())
-    await send_baccarat_image(bot, chat_id, player, banker, "🔴 BANKER 첫 번째 카드")
-    await asyncio.sleep(0.8)
-
-    player.append(deck.pop())
-    await send_baccarat_image(bot, chat_id, player, banker, "🔵 PLAYER 두 번째 카드")
-    await asyncio.sleep(0.8)
-
-    banker.append(deck.pop())
-    await send_baccarat_image(bot, chat_id, player, banker, "🔴 BANKER 두 번째 카드")
-    await asyncio.sleep(0.8)
+    player = [deck.pop(), deck.pop()]
+    banker = [deck.pop(), deck.pop()]
 
     ps = baccarat_score(player)
     bs = baccarat_score(banker)
-
     natural = ps in (8, 9) or bs in (8, 9)
     player_third = None
+    banker_third = None
 
+    # 바카라 기본 규칙에 따라 먼저 실제 결과용 카드를 결정한다.
     if not natural:
         if ps <= 5:
             player_third = deck.pop()
             player.append(player_third)
 
-            await send_baccarat_image(
-                bot,
-                chat_id,
-                player,
-                banker,
-                "🔵 PLAYER 추가 카드"
-            )
-            await asyncio.sleep(0.8)
-
         bs = baccarat_score(banker)
         banker_draw = False
-
         if player_third is None:
             banker_draw = bs <= 5
         else:
             tv = card_value(player_third)
-
             if bs <= 2:
                 banker_draw = True
             elif bs == 3:
@@ -1276,20 +1345,32 @@ async def play_baccarat(bot, chat_id, bets):
                 banker_draw = tv in (6, 7)
 
         if banker_draw:
-            banker.append(deck.pop())
+            banker_third = deck.pop()
+            banker.append(banker_third)
 
-            await send_baccarat_image(
-                bot,
-                chat_id,
-                player,
-                banker,
-                "🔴 BANKER 추가 카드"
-            )
-            await asyncio.sleep(0.8)
+    # 기본 4장 공개 GIF: 정확히 10초.
+    path = create_baccarat_gif(player[:2], banker[:2])
+    with open(path, "rb") as f:
+        await bot.send_animation(
+            chat_id=chat_id,
+            animation=InputFile(f),
+            caption="🎰 바카라 카드 공개 중...\n플레이어 → 뱅커 순서로 카드를 공개합니다."
+        )
+
+    # 추가카드는 기존 4장 아래가 아니라 해당 진영에 붙은 최종 바카라 그림으로 한 장 더 보낸다.
+    if player_third is not None or banker_third is not None:
+        await asyncio.sleep(0.2)
+        extra_path = create_baccarat_image(player, banker)
+        with open(extra_path, "rb") as f:
+            caption_parts = ["🎴 추가 카드 공개"]
+            if player_third is not None:
+                caption_parts.append(f"🔵 PLAYER 추가: {player_third['rank']}{SUITS[player_third['suit']][0]}")
+            if banker_third is not None:
+                caption_parts.append(f"🔴 BANKER 추가: {banker_third['rank']}{SUITS[banker_third['suit']][0]}")
+            await bot.send_photo(chat_id=chat_id, photo=InputFile(f), caption="\n".join(caption_parts))
 
     ps = baccarat_score(player)
     bs = baccarat_score(banker)
-
     if ps > bs:
         result = "P"
         result_text = "🔵 PLAYER 승리!"
@@ -1300,8 +1381,8 @@ async def play_baccarat(bot, chat_id, bets):
         result = "T"
         result_text = "🟢 TIE!"
 
-    await send_baccarat_image(bot, chat_id, player, banker, result_text)
-
+    # 모든 카드 연출이 끝난 뒤 2초 후에 결과를 보여준다.
+    await asyncio.sleep(2)
     await bot.send_message(
         chat_id=chat_id,
         text=(
@@ -1313,26 +1394,17 @@ async def play_baccarat(bot, chat_id, bets):
         )
     )
 
-    baccarat_history.append({
-        "result": result,
-        "player": ps,
-        "banker": bs
-    })
-
+    baccarat_history.append({"result": result, "player": ps, "banker": bs})
     if len(baccarat_history) > MAX_HISTORY:
         del baccarat_history[:-MAX_HISTORY]
 
-    hit = []
-    miss = []
-    settlement = []
-
+    hit, miss, settlement = [], [], []
     for uid, user_bets in bets.items():
         for bet in user_bets:
             typ = bet["type"]
             amount = bet["amount"]
             money_type = bet["money"]
             username = bet["name"]
-
             u = get_user(uid, username)
             unit = "원" if money_type == "R" else "P"
             balance = u["real_money"] if money_type == "R" else u["points"]
@@ -1340,102 +1412,55 @@ async def play_baccarat(bot, chat_id, bets):
             if typ == result:
                 payout = amount * 9 if result == "T" else amount * 2
                 new_balance = balance + payout
-
                 if money_type == "R":
                     update_user(uid, real_money=new_balance)
                 else:
                     update_user(uid, points=new_balance)
-
                 hit.append(
                     f"🎯 {username}님 적중하셨습니다!\n"
                     f"💰 적중금액: +{payout:,}{unit}\n"
                     f"💳 적중 후 보유머니: {new_balance:,}{unit}"
                 )
-
-                settlement.append(
-                    f"🎯 {username}: {payout:,}{unit} 적중"
-                )
-
+                settlement.append(f"🎯 {username}: {payout:,}{unit} 적중")
             elif result == "T" and typ in ("P", "B"):
                 new_balance = balance + amount
-
                 if money_type == "R":
                     update_user(uid, real_money=new_balance)
                 else:
                     update_user(uid, points=new_balance)
-
-                settlement.append(
-                    f"↩️ {username}: {amount:,}{unit} 반환"
-                )
-
+                settlement.append(f"↩️ {username}: {amount:,}{unit} 반환")
             else:
                 miss.append(
                     f"❌ {username}님 미적중하셨습니다.\n"
                     f"💸 손실금액: -{amount:,}{unit}"
                 )
-
                 add_xp_and_check_level(uid, -1)
-
-                settlement.append(
-                    f"❌ {username}: -{amount:,}{unit}"
-                )
+                settlement.append(f"❌ {username}: -{amount:,}{unit}")
 
     if hit:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="🎯 적중 결과\n━━━━━━━━━━━━━━\n" + "\n\n".join(hit)
-        )
-
+        await bot.send_message(chat_id=chat_id, text="🎯 적중 결과\n━━━━━━━━━━━━━━\n" + "\n\n".join(hit))
     if miss:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="📌 베팅 결과\n━━━━━━━━━━━━━━\n" + "\n\n".join(miss)
-        )
+        await bot.send_message(chat_id=chat_id, text="📌 베팅 결과\n━━━━━━━━━━━━━━\n" + "\n\n".join(miss))
 
     history_lines = ["📊 바카라 결과표", "━━━━━━━━━━━━━━"]
-
     for i, item in enumerate(reversed(baccarat_history), 1):
-        name = {
-            "P": "🔵 PLAYER",
-            "B": "🔴 BANKER",
-            "T": "🟢 TIE"
-        }[item["result"]]
-
-        history_lines.append(
-            f"{i}. {name} ({item['player']} : {item['banker']})"
-        )
-
-    await bot.send_message(
-        chat_id=chat_id,
-        text="\n".join(history_lines)
-    )
+        name = {"P": "🔵 PLAYER", "B": "🔴 BANKER", "T": "🟢 TIE"}[item["result"]]
+        history_lines.append(f"{i}. {name} ({item['player']} : {item['banker']})")
+    await bot.send_message(chat_id=chat_id, text="\n".join(history_lines))
 
     if settlement:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="💰 이번 바카라 정산\n━━━━━━━━━━━━━━\n" + "\n".join(settlement)
-        )
+        await bot.send_message(chat_id=chat_id,
+                                text="💰 이번 바카라 정산\n━━━━━━━━━━━━━━\n" + "\n".join(settlement))
 
 
 async def baccarat_timer(application, chat_id):
     try:
+        # 첫 배팅 시점부터 정확히 50초간 추가 베팅 가능
         await asyncio.sleep(50)
 
         async with game_lock:
-            if not baccarat_game["active"]:
+            if not baccarat_game["active"] or baccarat_game["chat_id"] != chat_id:
                 return
-
-        await application.bot.send_message(
-            chat_id=chat_id,
-            text="⏰ 바카라 베팅 마감 10초 전!\n⚠️ 10초 후 베팅이 마감됩니다."
-        )
-
-        await asyncio.sleep(10)
-
-        async with game_lock:
-            if not baccarat_game["active"]:
-                return
-
             baccarat_game["active"] = False
             bets = dict(baccarat_game["bets"])
             baccarat_game["bets"] = {}
@@ -1443,31 +1468,23 @@ async def baccarat_timer(application, chat_id):
 
         await application.bot.send_message(
             chat_id=chat_id,
-            text=(
-                "🔒 베팅 마감!\n"
-                "━━━━━━━━━━━━━━\n"
-                "🎰 베팅이 종료되었습니다.\n"
-                "🃏 카드를 공개합니다."
-            )
+            text="🔒 바카라 베팅 마감!\n━━━━━━━━━━━━━━\n🎰 베팅이 종료되었습니다.\n🎴 10초 동안 카드를 공개합니다."
         )
-
         await play_baccarat(application.bot, chat_id, bets)
-
     except Exception as e:
         print("바카라 타이머 오류:", repr(e))
 
 
 async def start_baccarat(update, context):
-    if not update.message:
-        return
-
-    await update.message.reply_text(
-        "🎰 바카라는 /바카라로 시작하지 않습니다.\n"
-        "첫 베팅을 입력하면 60초 라운드가 자동으로 시작됩니다.\n\n"
-        "/배팅 플 1000\n"
-        "/배팅 뱅 1000\n"
-        "/배팅 타이 1000"
-    )
+    # /바카라는 더 이상 카운트다운을 시작하지 않는다.
+    # 실제 첫 게임은 /배팅 플 1000 같은 첫 베팅 명령으로 시작한다.
+    if update.message:
+        await update.message.reply_text(
+            "🎰 바카라는 첫 베팅을 하는 순간 시작됩니다.\n\n"
+            "/배팅 플 1000\n"
+            "/배팅 뱅 1000\n"
+            "/배팅 타이 1000"
+        )
 
 
 def odd_even_value(card):
@@ -1485,116 +1502,66 @@ def odd_even_value(card):
     return int(rank)
 
 
-def create_odd_even_gif(card1, card2, result):
+def create_odd_even_gif(card1, card2):
+    # 50초 베팅 후 보여주는 카드 연출은 정확히 10초.
+    # 첫 번째 카드는 처음부터 앞면, 오른쪽 두 번째 카드만 뒤집힌다.
     width, height = 500, 300
-    frames = []
     bg = (20, 70, 45)
-
+    frames = []
     title_font = get_font(23, True)
     label_font = get_font(18, True)
-    result_font = get_font(24, True)
 
     front1 = Image.open(card1["file"]).convert("RGB").resize((110, 160))
     front2 = Image.open(card2["file"]).convert("RGB").resize((110, 160))
-    back = Image.open(
-        os.path.join(CARD_DIR, "BACK.png")
-    ).convert("RGB").resize((110, 160))
+    back = Image.open(os.path.join(CARD_DIR, "BACK.png")).convert("RGB").resize((110, 160))
 
-    def frame(left, right, result_text=""):
+    def frame(right, result_text=""):
         img = Image.new("RGB", (width, height), bg)
         draw = ImageDraw.Draw(img)
-
-        draw.text(
-            (width // 2, 25), "O D D  &  E V E N",
-            font=title_font, fill=(245, 220, 140), anchor="ma"
-        )
-        img.paste(left, (110, 70))
+        draw.text((width // 2, 25), "O D D  &  E V E N", font=title_font,
+                  fill=(245, 220, 140), anchor="ma")
+        img.paste(front1, (110, 70))
         img.paste(right, (280, 70))
-
-        draw.text((165, 250), "첫 번째", font=label_font,
-                  fill="white", anchor="ma")
-        draw.text((335, 250), "두 번째", font=label_font,
-                  fill="white", anchor="ma")
-
+        draw.text((165, 250), "첫 번째", font=label_font, fill="white", anchor="ma")
+        draw.text((335, 250), "두 번째", font=label_font, fill="white", anchor="ma")
         if result_text:
-            draw.text((width // 2, 282), result_text,
-                      font=result_font, fill=(255, 225, 100), anchor="mm")
+            draw.text((width // 2, 282), result_text, font=get_font(24, True),
+                      fill=(255, 225, 100), anchor="mm")
         return img
 
-    # 1. 두 카드 모두 뒷면으로 10초
-    for _ in range(40):
-        frames.append(frame(back, back))
-
-    # 2. 첫 번째 카드 실제 뒤집기
-    for i in range(20):
-        half = 10
-        if i < half:
-            scale = 1.0 - (i / half)
-            img = back
-        else:
-            scale = (i - half) / half
-            img = front1
-
-        w = max(6, int(110 * max(0.06, scale)))
-        card = img.resize((w, 160))
-
-        canvas = Image.new("RGB", (width, height), bg)
-        draw = ImageDraw.Draw(canvas)
-        draw.text((width // 2, 25), "O D D  &  E V E N",
-                  font=title_font, fill=(245, 220, 140), anchor="ma")
-        canvas.paste(card, (165 - w // 2, 70))
-        canvas.paste(back, (280, 70))
-        draw.text((165, 250), "첫 번째", font=label_font,
-                  fill="white", anchor="ma")
-        draw.text((335, 250), "두 번째", font=label_font,
-                  fill="white", anchor="ma")
-        frames.append(canvas)
-
-    # 3. 첫 번째 카드 공개 후 2초
+    # 2초: 첫 카드는 이미 앞면, 두 번째 카드만 뒷면.
     for _ in range(8):
-        frames.append(frame(front1, back))
+        frames.append(frame(back))
 
-    # 4. 두 번째 카드 실제 뒤집기
-    for i in range(20):
-        half = 10
+    # 6초: 오른쪽 카드만 실제로 뒤집힌다.
+    for i in range(24):
+        half = 12
         if i < half:
             scale = 1.0 - (i / half)
-            img = back
+            source = back
         else:
             scale = (i - half) / half
-            img = front2
-
+            source = front2
         w = max(6, int(110 * max(0.06, scale)))
-        card = img.resize((w, 160))
-
+        right = source.resize((w, 160))
         canvas = Image.new("RGB", (width, height), bg)
         draw = ImageDraw.Draw(canvas)
-        draw.text((width // 2, 25), "O D D  &  E V E N",
-                  font=title_font, fill=(245, 220, 140), anchor="ma")
+        draw.text((width // 2, 25), "O D D  &  E V E N", font=title_font,
+                  fill=(245, 220, 140), anchor="ma")
         canvas.paste(front1, (110, 70))
-        canvas.paste(card, (335 - w // 2, 70))
-        draw.text((165, 250), "첫 번째", font=label_font,
-                  fill="white", anchor="ma")
-        draw.text((335, 250), "두 번째", font=label_font,
-                  fill="white", anchor="ma")
+        canvas.paste(right, (335 - w // 2, 70))
+        draw.text((165, 250), "첫 번째", font=label_font, fill="white", anchor="ma")
+        draw.text((335, 250), "두 번째", font=label_font, fill="white", anchor="ma")
         frames.append(canvas)
 
-    # 5. 두 카드 모두 앞면인 상태로 2초
+    # 2초: 두 장 모두 앞면. 결과는 GIF 안에서 띄우지 않는다.
     for _ in range(8):
-        frames.append(frame(front1, front2))
+        frames.append(frame(front2))
 
-    # 6. 영상 안에서는 결과 문구를 표시하지 않는다.
-    #    두 카드가 모두 앞면이 된 뒤 영상이 끝나고,
-    #    2.5초 후 별도 결과 메시지를 보낸다.
     path = os.path.join(CARD_DIR, "odd_even.gif")
-    frames[0].save(
-        path,
-        save_all=True,
-        append_images=frames[1:],
-        duration=125,
-        loop=0
-    )
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=250, loop=0)
     return path
+
 
 async def odd_even_timer(application, chat_id):
     try:
@@ -1603,18 +1570,6 @@ async def odd_even_timer(application, chat_id):
         async with odd_even_lock:
             if not odd_even_game["active"] or odd_even_game["chat_id"] != chat_id:
                 return
-
-        await application.bot.send_message(
-            chat_id=chat_id,
-            text="⏰ 홀짝 베팅 마감 10초 전!\n⚠️ 10초 후 베팅이 마감됩니다.\n지금도 베팅할 수 있습니다."
-        )
-
-        await asyncio.sleep(10)
-
-        async with odd_even_lock:
-            if not odd_even_game["active"] or odd_even_game["chat_id"] != chat_id:
-                return
-
             odd_even_game["active"] = False
             bets = dict(odd_even_game["bets"])
             odd_even_game["bets"] = {}
@@ -1622,33 +1577,26 @@ async def odd_even_timer(application, chat_id):
 
         await application.bot.send_message(
             chat_id=chat_id,
-            text=(
-                "🔒 홀짝 베팅 마감!\n"
-                "━━━━━━━━━━━━━━\n"
-                "🎴 카드 공개 준비 중..."
-            )
+            text="🔒 홀짝 베팅 마감!\n━━━━━━━━━━━━━━\n🎴 10초 동안 카드가 공개됩니다.\n왼쪽 카드는 앞면, 오른쪽 카드만 뒤집힙니다."
         )
 
         deck = create_deck()
         card1 = deck.pop()
         card2 = deck.pop()
-
         total = odd_even_value(card1) + odd_even_value(card2)
         result = "O" if total % 2 else "E"
         result_name = "🟢 홀" if result == "O" else "🔵 짝"
 
-        path = create_odd_even_gif(card1, card2, result_name)
-
+        path = create_odd_even_gif(card1, card2)
         with open(path, "rb") as f:
             await application.bot.send_animation(
                 chat_id=chat_id,
                 animation=InputFile(f),
-                caption="🎴 카드 공개 중...\n두 번째 카드까지 공개됩니다."
+                caption="🎴 카드 공개 중...\n오른쪽 카드가 완전히 뒤집힌 후 결과가 나옵니다."
             )
 
-        # GIF는 약 12초. 영상이 끝난 뒤 2.5초 후 결과/정산을 공개한다.
-        await asyncio.sleep(RESULT_DELAY_SECONDS)
-
+        # GIF가 완전히 끝난 뒤 2초 후 결과 공개/정산
+        await asyncio.sleep(2)
         await application.bot.send_message(
             chat_id=chat_id,
             text=(
@@ -1661,16 +1609,13 @@ async def odd_even_timer(application, chat_id):
             )
         )
 
-        hit = []
-        miss = []
-
+        hit, miss = [], []
         for uid, user_bets in bets.items():
             for bet in user_bets:
                 typ = bet["type"]
                 amount = bet["amount"]
                 money_type = bet["money"]
                 username = bet["name"]
-
                 u = get_user(uid, username)
                 unit = "원" if money_type == "R" else "P"
                 balance = u["real_money"] if money_type == "R" else u["points"]
@@ -1678,12 +1623,10 @@ async def odd_even_timer(application, chat_id):
                 if typ == result:
                     payout = amount * 2
                     new_balance = balance + payout
-
                     if money_type == "R":
                         update_user(uid, real_money=new_balance)
                     else:
                         update_user(uid, points=new_balance)
-
                     hit.append(
                         f"🎯 {username}님 적중하셨습니다!\n"
                         f"💰 적중금액: +{payout:,}{unit}\n"
@@ -1694,7 +1637,6 @@ async def odd_even_timer(application, chat_id):
                         f"❌ {username}님 미적중하셨습니다.\n"
                         f"💸 손실금액: -{amount:,}{unit}"
                     )
-
                     add_xp_and_check_level(uid, -1)
 
         if hit:
@@ -1702,22 +1644,20 @@ async def odd_even_timer(application, chat_id):
                 chat_id=chat_id,
                 text="🎯 적중 결과\n━━━━━━━━━━━━━━\n" + "\n\n".join(hit)
             )
-
         if miss:
             await application.bot.send_message(
                 chat_id=chat_id,
                 text="📌 베팅 결과\n━━━━━━━━━━━━━━\n" + "\n\n".join(miss)
             )
-
     except Exception as e:
         print("홀짝 타이머 오류:", repr(e))
+
 
 async def odd_even_bet(update, context):
     if not update.message or not update.effective_user or not update.effective_chat:
         return
 
     parsed = parse_game_bet(context.args)
-
     if not parsed or parsed[0] not in ("O", "E"):
         await update.message.reply_text(
             "사용법:\n"
@@ -1734,14 +1674,14 @@ async def odd_even_bet(update, context):
     start_timer = False
 
     async with odd_even_lock:
-        # 첫 /홀짝 베팅이 들어온 순간부터 60초 라운드를 시작한다.
+        # 첫 /홀짝 홀 1000이 들어오는 순간부터 60초 게임 시작
         if not odd_even_game["active"]:
             odd_even_game["active"] = True
             odd_even_game["bets"] = {}
             odd_even_game["chat_id"] = chat_id
             start_timer = True
         elif odd_even_game["chat_id"] != chat_id:
-            await update.message.reply_text("❌ 다른 채팅에서 이미 홀짝 게임이 진행 중입니다.")
+            await update.message.reply_text("❌ 다른 채팅방에서 이미 홀짝이 진행 중입니다.")
             return
 
         u = get_user(uid, username)
@@ -1760,7 +1700,6 @@ async def odd_even_bet(update, context):
             return
 
         new_balance = balance - amount
-
         if money_type == "R":
             update_user(uid, real_money=new_balance)
         else:
@@ -1777,8 +1716,7 @@ async def odd_even_bet(update, context):
         await update.message.reply_text(
             "🎴 홀짝 베팅 시작!\n"
             "━━━━━━━━━━━━━━\n"
-            "⏱️ 첫 베팅부터 60초 동안 자유롭게 베팅할 수 있습니다.\n"
-            "⚠️ 마지막 10초에는 추가 베팅이 가능합니다.\n\n"
+            "⏱️ 첫 베팅부터 60초 동안 자유롭게 베팅할 수 있습니다.\n\n"
             "💰 베팅 방법\n"
             "/홀짝 홀 10000\n"
             "/홀짝 짝 10000\n"
@@ -1786,12 +1724,9 @@ async def odd_even_bet(update, context):
             "🟢 홀 = ODD\n"
             "🔵 짝 = EVEN"
         )
-        context.application.create_task(
-            odd_even_timer(context.application, chat_id)
-        )
+        context.application.create_task(odd_even_timer(context.application, chat_id))
 
     name = "홀" if bet_type == "O" else "짝"
-
     await update.message.reply_text(
         f"✅ {name} 베팅 완료되었습니다!\n"
         f"👤 {username}\n"
@@ -1800,16 +1735,14 @@ async def odd_even_bet(update, context):
         f"💳 베팅 후 보유머니: {new_balance:,}{unit}"
     )
 
-async def start_odd_even(update, context):
-    if not update.message:
-        return
 
-    await update.message.reply_text(
-        "🎴 홀짝은 /홀짝만 입력해서 시작하지 않습니다.\n"
-        "첫 베팅을 입력하면 60초 라운드가 자동으로 시작됩니다.\n\n"
-        "/홀짝 홀 1000\n"
-        "/홀짝 짝 1000"
-    )
+async def start_odd_even(update, context):
+    if update.message:
+        await update.message.reply_text(
+            "🎴 홀짝은 첫 베팅을 하는 순간 시작됩니다.\n\n"
+            "/홀짝 홀 1000\n"
+            "/홀짝 짝 1000"
+        )
 
 
 async def help_command(update, context):
@@ -1823,14 +1756,14 @@ async def help_command(update, context):
         "/출석\n"
         "/레벨업\n"
         "/채팅순위\n"
-        "/복권\n"
-        "/복권 실\n\n"
-        "🎰 바카라는 첫 /배팅으로 시작됩니다.\n"
+        "/복권 1장 ~ /복권 10장\n"
+        "/복권 실 1장 ~ /복권 실 10장\n\n"
+        "/바카라\n"
         "/배팅 플 1000\n"
         "/배팅 뱅 1000\n"
         "/배팅 타이 1000\n"
         "/배팅 플 실 50000\n\n"
-        "🎴 홀짝은 첫 베팅으로 시작됩니다.\n"
+        "/홀짝\n"
         "/홀짝 홀 1000\n"
         "/홀짝 짝 1000\n"
         "/홀짝 홀 실 50000\n\n"
