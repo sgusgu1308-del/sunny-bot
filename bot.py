@@ -1473,101 +1473,108 @@ def odd_even_value(card):
 
 
 def create_odd_even_gif(card1, card2, result):
-    width, height = 500, 260
+    width, height = 500, 300
     frames = []
     bg = (20, 70, 45)
 
     title_font = get_font(23, True)
     label_font = get_font(18, True)
-    result_font = get_font(22, True)
+    result_font = get_font(24, True)
 
-    front = Image.open(card1["file"]).convert("RGB").resize((110, 160))
+    front1 = Image.open(card1["file"]).convert("RGB").resize((110, 160))
+    front2 = Image.open(card2["file"]).convert("RGB").resize((110, 160))
     back = Image.open(
         os.path.join(CARD_DIR, "BACK.png")
     ).convert("RGB").resize((110, 160))
-    second = Image.open(card2["file"]).convert("RGB").resize((110, 160))
 
+    def frame(left, right, result_text=""):
+        img = Image.new("RGB", (width, height), bg)
+        draw = ImageDraw.Draw(img)
+
+        draw.text(
+            (width // 2, 25), "O D D  &  E V E N",
+            font=title_font, fill=(245, 220, 140), anchor="ma"
+        )
+        img.paste(left, (110, 70))
+        img.paste(right, (280, 70))
+
+        draw.text((165, 250), "첫 번째", font=label_font,
+                  fill="white", anchor="ma")
+        draw.text((335, 250), "두 번째", font=label_font,
+                  fill="white", anchor="ma")
+
+        if result_text:
+            draw.text((width // 2, 282), result_text,
+                      font=result_font, fill=(255, 225, 100), anchor="mm")
+        return img
+
+    # 1. 두 카드 모두 뒷면으로 10초
     for _ in range(40):
-        img = Image.new("RGB", (width, height), bg)
-        draw = ImageDraw.Draw(img)
+        frames.append(frame(back, back))
 
-        draw.text(
-            (width // 2, 25),
-            "O D D  &  E V E N",
-            font=title_font,
-            fill=(245, 220, 140),
-            anchor="ma"
-        )
-
-        img.paste(front, (110, 70))
-        img.paste(back, (280, 70))
-
-        draw.text(
-            (165, 245),
-            "첫 번째",
-            font=label_font,
-            fill="white",
-            anchor="ma"
-        )
-
-        draw.text(
-            (335, 245),
-            "두 번째",
-            font=label_font,
-            fill="white",
-            anchor="ma"
-        )
-
-        frames.append(img)
-
+    # 2. 첫 번째 카드 실제 뒤집기
     for i in range(20):
-        scale = max(0.06, 1.0 - i / 20.0)
-        w = max(6, int(110 * scale))
-        resized = second.resize((w, 160))
+        half = 10
+        if i < half:
+            scale = 1.0 - (i / half)
+            img = back
+        else:
+            scale = (i - half) / half
+            img = front1
 
-        img = Image.new("RGB", (width, height), bg)
-        draw = ImageDraw.Draw(img)
+        w = max(6, int(110 * max(0.06, scale)))
+        card = img.resize((w, 160))
 
-        draw.text(
-            (width // 2, 25),
-            "O D D  &  E V E N",
-            font=title_font,
-            fill=(245, 220, 140),
-            anchor="ma"
-        )
+        canvas = Image.new("RGB", (width, height), bg)
+        draw = ImageDraw.Draw(canvas)
+        draw.text((width // 2, 25), "O D D  &  E V E N",
+                  font=title_font, fill=(245, 220, 140), anchor="ma")
+        canvas.paste(card, (165 - w // 2, 70))
+        canvas.paste(back, (280, 70))
+        draw.text((165, 250), "첫 번째", font=label_font,
+                  fill="white", anchor="ma")
+        draw.text((335, 250), "두 번째", font=label_font,
+                  fill="white", anchor="ma")
+        frames.append(canvas)
 
-        img.paste(front, (110, 70))
-        img.paste(resized, (335 - w // 2, 70))
+    # 3. 첫 번째 카드 공개 후 2초
+    for _ in range(8):
+        frames.append(frame(front1, back))
 
-        frames.append(img)
+    # 4. 두 번째 카드 실제 뒤집기
+    for i in range(20):
+        half = 10
+        if i < half:
+            scale = 1.0 - (i / half)
+            img = back
+        else:
+            scale = (i - half) / half
+            img = front2
 
-    for _ in range(4):
-        img = Image.new("RGB", (width, height), bg)
-        draw = ImageDraw.Draw(img)
+        w = max(6, int(110 * max(0.06, scale)))
+        card = img.resize((w, 160))
 
-        draw.text(
-            (width // 2, 25),
-            "O D D  &  E V E N",
-            font=title_font,
-            fill=(245, 220, 140),
-            anchor="ma"
-        )
+        canvas = Image.new("RGB", (width, height), bg)
+        draw = ImageDraw.Draw(canvas)
+        draw.text((width // 2, 25), "O D D  &  E V E N",
+                  font=title_font, fill=(245, 220, 140), anchor="ma")
+        canvas.paste(front1, (110, 70))
+        canvas.paste(card, (335 - w // 2, 70))
+        draw.text((165, 250), "첫 번째", font=label_font,
+                  fill="white", anchor="ma")
+        draw.text((335, 250), "두 번째", font=label_font,
+                  fill="white", anchor="ma")
+        frames.append(canvas)
 
-        img.paste(front, (110, 70))
-        img.paste(second, (280, 70))
+    # 5. 두 카드 모두 앞면인 상태로 2초
+    for _ in range(8):
+        frames.append(frame(front1, front2))
 
-        draw.text(
-            (width // 2, 245),
-            result,
-            font=result_font,
-            fill=(255, 225, 100),
-            anchor="ma"
-        )
-
-        frames.append(img)
+    # 6. 뒤집기가 모두 끝난 뒤 결과를 2초 표시
+    for _ in range(8):
+        frames.append(frame(front1, front2, result))
 
     path = os.path.join(CARD_DIR, "odd_even.gif")
-
     frames[0].save(
         path,
         save_all=True,
@@ -1575,9 +1582,7 @@ def create_odd_even_gif(card1, card2, result):
         duration=250,
         loop=0
     )
-
     return path
-
 
 async def odd_even_timer(application, chat_id):
     try:
@@ -1628,15 +1633,23 @@ async def odd_even_timer(application, chat_id):
             await application.bot.send_animation(
                 chat_id=chat_id,
                 animation=InputFile(f),
-                caption=(
-                    f"🎴 홀짝 결과\n"
-                    f"━━━━━━━━━━━━━━\n"
-                    f"첫 번째 카드: {card1['rank']}\n"
-                    f"두 번째 카드: {card2['rank']}\n"
-                    f"합계: {total}\n\n"
-                    f"🏆 결과: {result_name}"
-                )
+                caption="🎴 카드 공개 중...\n두 번째 카드가 뒤집힌 뒤 결과가 공개됩니다."
             )
+
+        # 두 번째 카드가 완전히 뒤집힌 뒤 2초 후 최종 결과 공개
+        await asyncio.sleep(2)
+
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"🎴 홀짝 결과\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"첫 번째 카드: {card1['rank']}\n"
+                f"두 번째 카드: {card2['rank']}\n"
+                f"합계: {total}\n\n"
+                f"🏆 결과: {result_name}"
+            )
+        )
 
         hit = []
         miss = []
